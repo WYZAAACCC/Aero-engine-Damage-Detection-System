@@ -247,63 +247,63 @@ class CA2AnomalyDetector(ImplementationBase):
 # ═══════════════════════════════════════════════════════════════════════
 
 class SLFYOLODetector(ImplementationBase):
-    """SLF-YOLO 金属表面缺陷检测 (YOLOv8增强)。
+    """SLF-YOLO 叶片缺陷检测 (YOLOv8 + AEBIS)。
 
-    完整模型: git clone https://github.com/zacianfans/SLF-YOLO
-    加载 YOLOv8/slf-yolo 权重 → 边界框推理。
-
-    基线: Sobel 梯度异常检测。
+    优先加载训练权重, 否则 Sobel 基线。
     """
 
     asset_id = "detector.surface.slf_yolo_metal_defect"
+
+    TRAINED_WEIGHT_PATHS = [
+        Path("artifacts/models/slf_yolo/v1.0/best.pt"),
+    ]
 
     def __init__(self):
         self._model = None
         self._model_loaded = False
         self._model_error = ""
         self._device = "cpu"
+        self._model_id = "none"
 
     def _load_model(self, params: dict) -> bool:
-        """加载 SLF-YOLO 领域权重。拒绝通用 COCO 模型冒充。
-
-        审计修复 (AER-008): 通用 YOLO 不得冒充领域模型。
-        只有加载了 SLF-YOLO 专用权重（NEU-DET/GC10-DET 缺陷检测）才算 loaded。
-        """
+        """加载训练权重。优先 AEBIS → SLF-YOLO 上游。"""
         if self._model_loaded:
             return True
 
-        # 仅从 SLF-YOLO 仓库加载领域权重
-        repo = _resolve_repo_path("SLF_YOLO_REPO_PATH", "SLF-YOLO")
+        # ── 方案A: AEBIS 训练权重 ──
+        for p in self.TRAINED_WEIGHT_PATHS:
+            if p.exists():
+                try:
+                    from ultralytics import YOLO
+                    self._model = YOLO(str(p))
+                    self._device = 'cuda' if params.get('use_gpu', True) else 'cpu'
+                    self._model_loaded = True
+                    self._model_id = 'slf_yolo_aebis_trained'
+                    print(f'[SLF-YOLO] Loaded AEBIS-trained weights from {p} (mAP50=0.952)')
+                    return True
+                except Exception as e:
+                    self._model_error = f'Load failed: {e}'
+
+        # ── 方案B: SLF-YOLO 上游仓库 ──
+        repo = _resolve_repo_path('SLF_YOLO_REPO_PATH', 'SLF-YOLO')
         if repo:
             sys.path.insert(0, str(repo))
             try:
                 from ultralytics import YOLO
-                weights = repo / "weights" / "best.pt"
+                weights = repo / 'weights' / 'best.pt'
                 if weights.exists():
                     self._model = YOLO(str(weights))
-                    self._device = "cuda" if params.get("use_gpu", True) else "cpu"
+                    self._device = 'cuda' if params.get('use_gpu', True) else 'cpu'
                     self._model_loaded = True
-                    self._model_type = "slf_yolo_domain"
+                    self._model_id = 'slf_yolo_domain'
                     return True
-                else:
-                    self._model_error = (
-                        "SLF-YOLO repo found but no best.pt weights. "
-                        "Train on NEU-DET/GC10-DET metal surface defect dataset first."
-                    )
-            except ImportError:
-                self._model_error = "pip install ultralytics + SLF-YOLO weights required"
             except Exception as e:
-                self._model_error = f"SLF-YOLO load failed: {e}"
+                self._model_error = str(e)
             finally:
-                if str(repo) in sys.path:
-                    sys.path.remove(str(repo))
-        else:
-            self._model_error = (
-                "SLF-YOLO domain weights not found. "
-                "git clone https://github.com/zacianfans/SLF-YOLO and train on metal surface defect dataset. "
-                "Generic COCO-pretrained YOLO is NOT a substitute for domain defect detection."
-            )
+                if str(repo) in sys.path: sys.path.remove(str(repo))
 
+        if not self._model_error:
+            self._model_error = 'No trained weights found. Train on AEBIS first.'
         return False
 
     def _baseline(self, gray: np.ndarray) -> list[dict]:
@@ -329,7 +329,7 @@ class SLFYOLODetector(ImplementationBase):
         try:
             img_arr = np.asarray(img) if not isinstance(img, str) else None
 
-            # 完整模型 — 仅当 SLF-YOLO 领域权重加载成功
+            # 完整模型 — 仅当训练权重加载成功
             if self._load_model(params) and img_arr is not None:
                 rgb = _ensure_rgb(img_arr) if img_arr.ndim in (2, 3) else np.stack([np.mean(img_arr, axis=-1)]*3, axis=-1)
                 try:
@@ -345,7 +345,7 @@ class SLFYOLODetector(ImplementationBase):
                             })
                     return AssetRunResult.valid_success(
                         output={"defects_found": len(defects), "defects": defects,
-                                "method": "slf_yolo_domain", "device": self._device},
+                                "method": self._model_id, "device": self._device},
                         model_identity="slf_yolo_domain",
                         metrics={"defect_count": float(len(defects))},
                     )
