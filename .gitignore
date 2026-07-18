@@ -51,6 +51,7 @@ trace_output.json
 integration_test.py
 verify_reliability.py
 test_integrity.py
+check_models.py
 # Model weights (too large for git)
 *.pt
 *.pth
