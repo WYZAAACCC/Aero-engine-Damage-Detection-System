@@ -267,76 +267,113 @@ class WCambaBearingFaultDetector(ImplementationBase):
 # ═══════════════════════════════════════════════════════════════════════
 
 class FaultSenseLSTMDetector(ImplementationBase):
-    """FaultSense LSTM 自编码器异常检测。
+    """FaultSense LSTM-AE 异常检测 + RUL — PyTorch移植版。
 
-    完整模型: git clone https://github.com/momo-2609/FaultSense-LSTM-Anomaly-Detection-on-NASA-CMAPSS
-    加载 TensorFlow/Keras LSTM-AE → 重构误差异常评分。
-
-    基线: 滑动窗口退化趋势分析。
+    加载本仓库训练权重 (artifacts/models/faultsense/),
+    否则回退滑动窗口趋势基线。
     """
 
     asset_id = "detector.timeseries.faultsense_lstm_autoencoder"
 
-    CMAPSS_SENSORS = [
-        "T2", "T24", "T30", "T50", "P2", "P15", "P30", "Nf", "Nc",
-        "epr", "Ps30", "phi", "NRf", "NRc", "BPR", "farB", "htBleed",
-        "Nf_dmd", "PCNfR_dmd", "W31", "W32",
+    TRAINED_WEIGHT_PATHS = [
+        Path("artifacts/models/faultsense/v1.0/FD001/best_model.pth"),
+        Path("artifacts/models/faultsense/v1.0/FD003/best_model.pth"),
     ]
+    SEQ_LEN = 30
+    N_FEATURES = 14
+    RUL_CAP = 130
 
     def __init__(self):
         self._model = None
         self._loaded = False
         self._error = ""
+        self._config = {}
+        self._model_identity = "none"
 
-    def _load_model(self, params: dict) -> bool:
-        """加载 FaultSense 训练好的 LSTM-AE。拒绝未训练模型。
+    def _build_model(self):
+        """构建 FaultSense LSTM-AE + RUL (与训练一致)。"""
+        import torch
+        import torch.nn as nn
 
-        审计修复 (AER-009): 未训练的 LSTM-AE 重构误差没有可解释性。
-        """
+        class FaultSenseModel(nn.Module):
+            def __init__(self, n_features=14, hidden=32, dropout=0.5):
+                super().__init__()
+                self.encoder = nn.LSTM(n_features, hidden, num_layers=2,
+                                       batch_first=True, dropout=dropout)
+                self.decoder = nn.LSTM(hidden, hidden, num_layers=1, batch_first=True)
+                self.reconstruct = nn.Linear(hidden, n_features)
+                self.rul_fc = nn.Sequential(
+                    nn.Linear(hidden, hidden // 2), nn.ReLU(),
+                    nn.Dropout(dropout), nn.Linear(hidden // 2, 1), nn.Sigmoid())
+                t = torch.tensor(0.0)
+                self.register_buffer('threshold', t)
+
+            def encode(self, x):
+                _, (h_n, _) = self.encoder(x)
+                return h_n[-1]
+
+            def decode(self, h, seq_len):
+                h = h.unsqueeze(1).repeat(1, seq_len, 1)
+                dec_out, _ = self.decoder(h)
+                return self.reconstruct(dec_out)
+
+            def forward(self, x):
+                seq_len = x.size(1)
+                h = self.encode(x)
+                recon = self.decode(h, seq_len)
+                rul_pred = self.rul_fc(h)
+                return recon, rul_pred
+
+        return FaultSenseModel(n_features=self.N_FEATURES)
+
+    def _load_model(self) -> bool:
+        """加载训练好的 FaultSense PyTorch 权重。"""
         if self._loaded:
             return True
+        try:
+            import torch
+        except ImportError:
+            self._error = "pip install torch required"
+            return False
 
-        # 仅从 FaultSense 仓库加载已训练的 .h5 模型
-        repo = _resolve_repo_path("FAULTSENSE_REPO_PATH", "FaultSense-LSTM-Anomaly-Detection-on-NASA-CMAPSS")
-        if repo:
-            try:
-                import tensorflow as tf
-                model_path = repo / "models" / "lstm_autoencoder.h5"
-                if model_path.exists():
-                    self._model = tf.keras.models.load_model(str(model_path))
+        for p in self.TRAINED_WEIGHT_PATHS:
+            if p.exists():
+                try:
+                    self._model = self._build_model()
+                    checkpoint = torch.load(str(p), map_location="cpu", weights_only=False)
+                    self._model.load_state_dict(checkpoint["model_state_dict"])
+                    self._model.eval()
                     self._loaded = True
-                    self._model_type = "lstm_ae_trained"
+                    self._config = {
+                        "subset": checkpoint.get("subset", "FD001"),
+                        "threshold": float(checkpoint.get("threshold", 0.5)),
+                        "val_rmse": checkpoint.get("val_rmse", 0),
+                    }
+                    self._model_identity = f"faultsense_lstm_ae_{self._config['subset'].lower()}_trained"
+                    print(f"[FaultSense] Loaded trained weights from {p} "
+                          f"(subset={self._config['subset']}, val_rmse={self._config['val_rmse']:.1f})")
                     return True
-                else:
-                    self._error = (
-                        "FaultSense repo found but no trained model (models/lstm_autoencoder.h5). "
-                        "Train on C-MAPSS dataset first: "
-                        "git clone https://github.com/momo-2609/FaultSense-LSTM-Anomaly-Detection-on-NASA-CMAPSS"
-                    )
-            except ImportError:
-                self._error = "pip install tensorflow required for FaultSense LSTM-AE"
-            except Exception as e:
-                self._error = f"TF model load failed: {e}"
-        else:
-            self._error = (
-                "FaultSense LSTM-AE model not found. "
-                "git clone https://github.com/momo-2609/FaultSense-LSTM-Anomaly-Detection-on-NASA-CMAPSS "
-                "and train on C-MAPSS. "
-                "An UNTRAINED LSTM autoencoder produces meaningless reconstruction errors."
-            )
+                except Exception as e:
+                    self._error = f"Failed to load {p}: {e}"
+                    self._model = None
 
+        if not self._error:
+            self._error = (
+                "No trained FaultSense weights found. Train first: "
+                "python training/scripts/train/train_faultsense.py --subset FD001"
+            )
         return False
 
-    def _trend_baseline(self, sensor_values: dict, params: dict) -> dict:
+    def _trend_baseline(self, signals: dict) -> dict:
         """滑动窗口退化趋势基线。"""
-        trends = [v.get("trend", 0) for v in sensor_values.values() if "trend" in v]
-        if trends:
-            max_abs = max(abs(t) for t in trends)
-            score = min(max_abs / params.get("trend_threshold", 0.005), 1.0)
-        else:
-            score = 0.0
-        is_anomalous = score > 0.25
-        return {"anomaly_detected": bool(is_anomalous), "anomaly_score": round(float(score), 6)}
+        trends = []
+        for arr in signals.values():
+            if isinstance(arr, np.ndarray) and len(arr) > 10:
+                t = np.polyfit(np.arange(len(arr)), arr, 1)[0]
+                trends.append(t)
+        max_abs = max(abs(t) for t in trends) if trends else 0
+        score = min(max_abs / 0.005, 1.0)
+        return {"anomaly_detected": score > 0.25, "anomaly_score": round(float(score), 6)}
 
     def validate_inputs(self, inputs: list, parameters: dict, context: dict) -> dict:
         if not inputs:
@@ -344,71 +381,76 @@ class FaultSenseLSTMDetector(ImplementationBase):
         return {"ok": True, "issues": []}
 
     def run(self, inputs: list, parameters: dict, context: dict) -> AssetRunResult:
-        params = {**self.default_params(), **parameters}
         data = inputs[0] if inputs else {}
 
-        # 提取传感器统计
-        sensor_values = {}
-        sensor_arrays = {}
-        for ch in self.CMAPSS_SENSORS:
-            val = data.get(ch)
-            if val is not None:
-                if isinstance(val, (list, np.ndarray)):
-                    arr = np.asarray(val, dtype=np.float64)
-                    sensor_values[ch] = {
-                        "mean": float(np.mean(arr)), "std": float(np.std(arr)),
-                        "trend": float(np.polyfit(np.arange(len(arr)), arr, 1)[0]) if len(arr) > 5 else 0,
-                    }
-                    sensor_arrays[ch] = arr
-                else:
-                    sensor_values[ch] = {"value": float(val)}
-
-        # 完整 LSTM-AE 推理 — 仅当训练好的模型加载
-        if self._loaded and len(sensor_arrays) >= 3:
+        # ── 真实 LSTM-AE 推理 ──
+        if self._load_model():
             try:
-                seq_len = params.get("sequence_length", 50)
-                arrays_list = []
-                for ch in self.CMAPSS_SENSORS[:21]:
-                    arr = sensor_arrays.get(ch, np.zeros(seq_len))
-                    if len(arr) < seq_len:
-                        arr = np.pad(arr, (0, seq_len - len(arr)))
-                    arrays_list.append(arr[:seq_len])
-                if len(arrays_list) >= 3:
-                    X = np.stack(arrays_list, axis=-1).reshape(1, seq_len, -1)
-                    X_pred = self._model.predict(X, verbose=0)
-                    mse = float(np.mean((X - X_pred) ** 2))
-                    score = min(mse / params.get("mse_threshold", 0.01), 1.0)
+                import torch
+                # 提取传感器序列
+                cmapss_keys = [f"s{i}" for i in
+                    [2, 3, 4, 7, 8, 9, 11, 12, 13, 14, 15, 17, 20, 21]]
+                arrays = []
+                for k in cmapss_keys:
+                    v = data.get(k)
+                    if isinstance(v, (list, np.ndarray)):
+                        arrays.append(np.asarray(v, dtype=np.float32))
+                # 回退: 使用任何可用序列
+                if len(arrays) < 3:
+                    for v in data.values():
+                        if isinstance(v, (list, np.ndarray)) and len(v) >= self.SEQ_LEN:
+                            arrays.append(np.asarray(v, dtype=np.float32))
+                        if len(arrays) >= self.N_FEATURES:
+                            break
+                if len(arrays) >= 3:
+                    # 补齐并对齐
+                    while len(arrays) < self.N_FEATURES:
+                        arrays.append(np.zeros_like(arrays[0]))
+                    min_len = min(len(a) for a in arrays)
+                    seq = np.stack([a[-min_len:] for a in arrays[:self.N_FEATURES]], axis=-1)
+                    if seq.shape[0] < self.SEQ_LEN:
+                        seq = np.pad(seq, ((self.SEQ_LEN - seq.shape[0], 0), (0, 0)), mode='edge')
+                    seq = seq[-self.SEQ_LEN:].astype(np.float32)
+
+                    x = torch.tensor(seq).float().unsqueeze(0)
+                    with torch.no_grad():
+                        recon, rul_pred = self._model(x)
+                        mse = float(torch.mean((x - recon) ** 2))
+                    threshold = self._config.get("threshold", 0.6)
+                    is_anomaly = mse > threshold
+                    rul = max(0, float(rul_pred.item() * self.RUL_CAP))
+
                     return AssetRunResult.valid_success(
                         output={
-                            "anomaly_detected": bool(score > params.get("threshold_sigma", 2.5) / 10),
-                            "anomaly_score": round(score, 6),
+                            "anomaly_detected": is_anomaly,
+                            "anomaly_score": round(mse, 6),
                             "reconstruction_mse": round(mse, 6),
-                            "method": "lstm_autoencoder_trained",
+                            "threshold": round(threshold, 6),
+                            "rul_cycles": round(rul, 1),
+                            "method": self._model_identity,
+                            "subset": self._config.get("subset", "unknown"),
                         },
-                        model_identity="lstm_ae_trained",
-                        metrics={"anomaly_score": score, "reconstruction_mse": mse, "sensor_count": float(len(sensor_arrays))},
+                        model_identity=self._model_identity,
+                        metrics={"anomaly_score": mse, "reconstruction_mse": mse, "rul": rul},
                     )
             except Exception as e:
                 return AssetRunResult(
                     execution_status="failed", validity_status="invalid",
-                    error=f"LSTM-AE inference failed: {e}",
+                    error=f"FaultSense inference failed: {e}",
                     structured_output={}, metrics={},
                 )
 
-        # 基线 — 简单趋势分析，没有工况归一化和协变量处理
-        result = self._trend_baseline(sensor_values, params)
+        # ── 基线 ──
+        signals = {k: np.asarray(v, dtype=np.float64) for k, v in data.items()
+                    if isinstance(v, (list, np.ndarray))}
+        result = self._trend_baseline(signals)
         return AssetRunResult.degraded(
             method="sliding_window_trend_baseline",
-            reason=(
-                f"FaultSense trained LSTM-AE not loaded: {self._error}. "
-                "Trend baseline uses linear slope with hardcoded thresholds — "
-                "no operating condition normalization, no sensor covariance handling, "
-                "no healthy baseline, no confidence intervals."
-            ),
+            reason=f"FaultSense trained weights not loaded: {self._error}",
             output=result,
-            metrics={"anomaly_score": result["anomaly_score"], "sensor_count": float(len(sensor_values))},
+            metrics={"anomaly_score": result["anomaly_score"]},
         )
 
     @staticmethod
     def default_params() -> dict:
-        return {"sequence_length": 50, "n_features": 21, "threshold_sigma": 2.5, "trend_threshold": 0.005, "mse_threshold": 0.01}
+        return {"sequence_length": 30, "n_features": 14, "threshold_sigma": 2.5, "trend_threshold": 0.005}
