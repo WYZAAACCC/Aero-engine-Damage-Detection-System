@@ -59,3 +59,4 @@ check_models.py
 data/
 # API keys
 apikey.txt
+artifacts/
