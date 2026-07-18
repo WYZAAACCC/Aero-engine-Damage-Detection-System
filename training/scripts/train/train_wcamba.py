@@ -53,10 +53,72 @@ class WideKernel1DCNN(nn.Module):
 # ── CWRU 数据加载器 ──
 
 class CWRUDataset(Dataset):
-    """从 .mat 或 .npz 文件加载 CWRU 轴承数据。
+    """从 .mat 文件加载 CWRU 轴承数据。
 
-    窗口长度 1024, 训练时 50% 重叠, 验证/测试不重叠。
+    文件编号→类别映射（基于CWRU官网12k Drive End页面）:
+      97-100:  Normal (0 HP ~ 3 HP)
+      105-108: Inner Race 0.007" (0-3 HP)
+      118-121: Ball 0.007" (0-3 HP)
+      130-133: Outer Race @6:00 0.007" (0-3 HP)
+      169-172: Inner Race 0.014" (0-3 HP)
+      185-188: Ball 0.014" (0-3 HP)
+      197-200: Outer Race @6:00 0.014" (0-3 HP)
+      209-212: Inner Race 0.021" (0-3 HP)
+      222-225: Ball 0.021" (0-3 HP)
+      234-237: Outer Race @6:00 0.021" (0-3 HP)
+      3001-3004: Inner Race 0.028" (0-3 HP)
+      3005-3008: Ball 0.028" (0-3 HP)
     """
+
+    # ── 文件编号→类别映射 ──
+    FILE_CLASS_MAP = {}
+    # Normal: 97-100
+    for fn in range(97, 101): FILE_CLASS_MAP[fn] = 0
+    # Inner Race (0.007"): 105-108
+    for fn in range(105, 109): FILE_CLASS_MAP[fn] = 1
+    # Inner Race (0.014"): 169-172
+    for fn in range(169, 173): FILE_CLASS_MAP[fn] = 1
+    # Inner Race (0.021"): 209-212
+    for fn in range(209, 213): FILE_CLASS_MAP[fn] = 1
+    # Inner Race (0.028"): 3001-3004
+    for fn in range(3001, 3005): FILE_CLASS_MAP[fn] = 1
+    # Ball (0.007"): 118-121
+    for fn in range(118, 122): FILE_CLASS_MAP[fn] = 3
+    # Ball (0.014"): 185-188
+    for fn in range(185, 189): FILE_CLASS_MAP[fn] = 3
+    # Ball (0.021"): 222-225
+    for fn in range(222, 226): FILE_CLASS_MAP[fn] = 3
+    # Ball (0.028"): 3005-3008
+    for fn in range(3005, 3009): FILE_CLASS_MAP[fn] = 3
+    # Outer Race @6:00 (0.007"): 130-133
+    for fn in range(130, 134): FILE_CLASS_MAP[fn] = 2
+    # Outer Race @6:00 (0.014"): 197-200
+    for fn in range(197, 201): FILE_CLASS_MAP[fn] = 2
+    # Outer Race @6:00 (0.021"): 234-237
+    for fn in range(234, 238): FILE_CLASS_MAP[fn] = 2
+
+    CLASS_NAMES = ["normal", "inner_race", "outer_race", "ball"]
+
+    @classmethod
+    def get_class(cls, fpath: Path) -> int | None:
+        """从文件路径推断类别。"""
+        try:
+            fn = int(fpath.stem)
+            return cls.FILE_CLASS_MAP.get(fn)
+        except ValueError:
+            pass
+        # 也支持原始命名文件 (如 normal_0.mat, IR007_0.mat 等)
+        fname = fpath.stem.lower().replace("-", "_")
+        if "normal" in fname or "baseline" in fname:
+            return 0
+        if "inner" in fname or "ir0" in fname:
+            return 1
+        if "outer" in fname or "or0" in fname:
+            return 2
+        if "ball" in fname or "b0" in fname:
+            return 3
+        return None
+
     def __init__(self, data_dir: str, split: str = "train",
                  window_size: int = 1024, overlap: float = 0.5,
                  instance_ids: list = None):
@@ -72,18 +134,9 @@ class CWRUDataset(Dataset):
             raise FileNotFoundError(f"No .mat or .npz files found in {data_dir}")
 
         for fpath in files:
-            fname = fpath.stem.lower()
-            # 类别判定
-            if "normal" in fname or "baseline" in fname:
-                label = 0
-            elif "inner" in fname or "ir" in fname:
-                label = 1
-            elif "outer" in fname or "or" in fname:
-                label = 2
-            elif "ball" in fname or "b" in fname.replace("ball", ""):
-                label = 3
-            else:
-                continue  # 跳过无法识别的文件
+            label = self.get_class(fpath)
+            if label is None:
+                continue
 
             # 只加载指定 instance 的文件
             if instance_ids is not None and fpath.stem not in instance_ids:
@@ -216,12 +269,33 @@ def main():
     instances = sorted(all_instances)
     print(f"[INFO] Found {len(instances)} data files")
 
-    # 按 instance 分组划分 (70/15/15)
-    np.random.shuffle(instances)
-    n = len(instances)
-    train_ids = set(instances[:int(n * 0.7)])
-    val_ids = set(instances[int(n * 0.7):int(n * 0.85)])
-    test_ids = set(instances[int(n * 0.85):])
+    # 按类别分组，确保每类都出现在各 split 中
+    class_files = {i: [] for i in range(4)}
+    for fname in instances:
+        fpath = data_dir / (fname + ".mat")
+        if not fpath.exists():
+            fpath = data_dir / fname
+        if fpath.exists():
+            cls = CWRUDataset.get_class(fpath)
+            if cls is not None:
+                class_files[cls].append(fname)
+
+    print(f"[INFO] Class distribution: " +
+          ", ".join(f"{CWRUDataset.CLASS_NAMES[c]}: {len(class_files[c])}" for c in range(4)))
+
+    # 每类分层划分 (60/20/20)
+    train_ids, val_ids, test_ids = set(), set(), set()
+    for cls in range(4):
+        files = class_files[cls]
+        np.random.shuffle(files)
+        n = len(files)
+        if n == 0:
+            continue
+        n_train = max(1, int(n * 0.6))
+        n_val = max(1, int(n * 0.2))
+        train_ids.update(files[:n_train])
+        val_ids.update(files[n_train:n_train + n_val])
+        test_ids.update(files[n_train + n_val:])
 
     if args.smoke_test:
         train_ids = set(list(train_ids)[:4])
@@ -229,9 +303,9 @@ def main():
         test_ids = set(list(test_ids)[:2])
         args.epochs = 2
 
-    train_ds = CWRUDataset(args.data, "train", args.window_size, 0.5, train_ids)
-    val_ds = CWRUDataset(args.data, "val", args.window_size, 0.0, val_ids)
-    test_ds = CWRUDataset(args.data, "test", args.window_size, 0.0, test_ids)
+    train_ds = CWRUDataset(args.data, "train", args.window_size, 0.5, list(train_ids))
+    val_ds = CWRUDataset(args.data, "val", args.window_size, 0.0, list(val_ids))
+    test_ds = CWRUDataset(args.data, "test", args.window_size, 0.0, list(test_ids))
 
     print(f"[DATA] Train: {len(train_ds)}, Val: {len(val_ds)}, Test: {len(test_ds)}")
 
