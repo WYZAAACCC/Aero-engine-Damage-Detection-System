@@ -33,32 +33,66 @@ def _resolve_repo_path(env_var: str, default_dir: str) -> Path | None:
 # ═══════════════════════════════════════════════════════════════════════
 
 class WCambaBearingFaultDetector(ImplementationBase):
-    """WCamba 轻量 CNN+Mamba 轴承故障诊断。
+    """WCamba 轴承故障诊断 — 4类 (normal/inner_race/outer_race/ball)。
 
-    完整模型: git clone https://github.com/CDUT-IMRT/WCamba
-    加载 PyTorch 模型 → 4 类轴承故障分类。
-
-    基线: Hilbert 包络谱 + 故障特征频率匹配。
+    优先加载训练权重 (artifacts/models/wcamba_cwru_4class/),
+    其次尝试上游 WCamba 仓库, 否则使用包络谱基线。
     """
 
     asset_id = "detector.vibration.wcamba_bearing_fault"
+
+    CLASS_NAMES = ["normal", "inner_race", "outer_race", "ball"]
 
     BEARING_FAULTS = {
         "inner_race": {"freq_ratio": 5.43},
         "outer_race": {"freq_ratio": 3.57},
         "ball": {"freq_ratio": 2.35},
-        "cage": {"freq_ratio": 0.38},
     }
+
+    # ── 训练权重搜索路径 ──
+    TRAINED_WEIGHT_PATHS = [
+        Path("artifacts/models/wcamba_cwru_4class/v1.0/best_model.pth"),
+        Path("artifacts/models/wcamba_cwru_4class/v1.0/best_model.pth").absolute(),
+    ]
 
     def __init__(self):
         self._model = None
         self._loaded = False
         self._error = ""
+        self._model_type = "none"
+
+    def _build_model(self):
+        """构建与训练时一致的 WideKernel 1D-CNN。"""
+        import torch.nn as nn
+
+        class WideKernel1DCNN(nn.Module):
+            def __init__(self, in_channels=1, num_classes=4, d_model=64):
+                super().__init__()
+                self.conv1 = nn.Conv1d(in_channels, 16, kernel_size=64, stride=2, padding=32)
+                self.bn1 = nn.BatchNorm1d(16)
+                self.conv2 = nn.Conv1d(16, 32, kernel_size=3, stride=2, padding=1)
+                self.bn2 = nn.BatchNorm1d(32)
+                self.conv3 = nn.Conv1d(32, d_model, kernel_size=3, stride=2, padding=1)
+                self.bn3 = nn.BatchNorm1d(d_model)
+                self.pool = nn.AdaptiveAvgPool1d(1)
+                self.fc = nn.Linear(d_model, num_classes)
+                self.relu = nn.ReLU()
+                self.dropout = nn.Dropout(0.2)
+
+            def forward(self, x):
+                x = self.relu(self.bn1(self.conv1(x)))
+                x = self.relu(self.bn2(self.conv2(x)))
+                x = self.relu(self.bn3(self.conv3(x)))
+                x = self.pool(x).squeeze(-1)
+                x = self.dropout(x)
+                return self.fc(x)
+
+        return WideKernel1DCNN(in_channels=1, num_classes=4)
 
     def _load_model(self, params: dict) -> bool:
-        """加载 WCamba 领域权重。拒绝随机初始化网络。
-
-        审计修复 (AER-009): 权重缺失必须 unavailable，不能创建随机网络。
+        """加载训练权重。按优先级:
+        1. 本仓库训练产物 (artifacts/models/wcamba_cwru_4class/)
+        2. 上游 WCamba 仓库权重
         """
         if self._loaded:
             return True
@@ -70,43 +104,58 @@ class WCambaBearingFaultDetector(ImplementationBase):
             self._error = "pip install torch required"
             return False
 
-        # 仅从 WCamba 仓库加载训练好的权重
+        # ── 方案A: 加载本仓库训练权重 ──
+        for p in self.TRAINED_WEIGHT_PATHS:
+            if p.exists():
+                try:
+                    self._model = self._build_model()
+                    checkpoint = torch.load(str(p), map_location="cpu", weights_only=False)
+                    self._model.load_state_dict(checkpoint["model_state_dict"])
+                    self._model.eval()
+                    self._loaded = True
+                    self._model_type = "wcamba_cwru_4class_trained"
+                    # 验证权重
+                    class_names = checkpoint.get("class_names", self.CLASS_NAMES)
+                    self.CLASS_NAMES = class_names
+                    val_acc = checkpoint.get("val_accuracy", 0)
+                    print(f"[WCamba] Loaded trained weights from {p} "
+                          f"(val_acc={val_acc:.4f}, classes={class_names})")
+                    return True
+                except Exception as e:
+                    self._error = f"Failed to load trained weights from {p}: {e}"
+                    self._model = None
+
+        # ── 方案B: 上游 WCamba 仓库 ──
         repo = _resolve_repo_path("WCAMBA_REPO_PATH", "WCamba")
         if repo:
             sys.path.insert(0, str(repo))
             try:
-                from models.wcamba import WCambaModel
-                self._model = WCambaModel(
-                    in_channels=1, num_classes=4,
-                    d_model=params.get("d_model", 64),
-                )
+                from models.wcamba import WCambaModel  # noqa: F811
+                self._model = WCambaModel(in_channels=1, num_classes=4,
+                                          d_model=params.get("d_model", 64))
                 weights = repo / "checkpoints" / "best_model.pth"
                 if weights.exists():
-                    state = torch.load(str(weights), map_location="cpu")
+                    state = torch.load(str(weights), map_location="cpu", weights_only=False)
                     self._model.load_state_dict(state)
                     self._model.eval()
                     self._loaded = True
-                    self._model_type = "wcamba_cnn_mamba_trained"
+                    self._model_type = "wcamba_cnn_mamba_upstream"
                     return True
                 else:
-                    self._error = (
-                        "WCamba repo found but no trained weights (checkpoints/best_model.pth). "
-                        "Train on bearing fault dataset (CWRU/PU/XJTU-SY) first."
-                    )
+                    self._error = "WCamba repo found but no checkpoints/best_model.pth"
             except ImportError as e:
-                self._error = f"WCamba repo found but import failed: {e}"
+                self._error = f"WCamba repo import failed: {e}"
             except Exception as e:
                 self._error = f"WCamba load failed: {e}"
             finally:
                 if str(repo) in sys.path:
                     sys.path.remove(str(repo))
-        else:
-            self._error = (
-                "WCamba model not found. "
-                "git clone https://github.com/CDUT-IMRT/WCamba and train on bearing dataset. "
-                "A randomly initialized CNN has NO statistical meaning for fault diagnosis."
-            )
 
+        if not self._error:
+            self._error = (
+                "No trained weights found. Train WCamba on CWRU data first: "
+                "python training/scripts/train/train_wcamba.py --data artifacts/raw/cwru"
+            )
         return False
 
     def _envelope_baseline(self, sig: np.ndarray, fs: float, speed_rpm: float) -> dict:
@@ -160,25 +209,32 @@ class WCambaBearingFaultDetector(ImplementationBase):
         speed_rpm = float(data.get("speed_rpm", params.get("speed_rpm", 3000.0)))
 
         # 完整深度学习推理 — 仅当 WCamba 训练权重加载成功
-        if self._load_model(params) and len(sig) >= 2048:
+        # 输入窗口1024点（与训练时一致），per-window z-score归一化
+        if self._load_model(params) and len(sig) >= 1024:
             try:
                 import torch
-                seg = sig[:2048]
+                seg = sig[:1024].astype(np.float32)
+                # per-window z-score 归一化（与训练时一致）
+                std = seg.std()
+                if std > 1e-8:
+                    seg = (seg - seg.mean()) / std
                 tensor = torch.tensor(seg, dtype=torch.float32).unsqueeze(0).unsqueeze(0)
                 with torch.no_grad():
                     logits = self._model(tensor)
-                    probs = torch.softmax(logits, dim=-1).squeeze().numpy()
-                class_names = ["inner_race", "outer_race", "ball", "cage"]
+                    probs = torch.softmax(logits, dim=-1).squeeze().cpu().numpy()
+                class_names = self.CLASS_NAMES
                 pred_idx = int(np.argmax(probs))
                 return AssetRunResult.valid_success(
                     output={
-                        "fault_detected": bool(probs[pred_idx] > 0.5),
+                        "fault_detected": bool(pred_idx != 0 or probs[pred_idx] < 0.9),
                         "fault_type": class_names[pred_idx],
-                        "probabilities": {class_names[i]: round(float(probs[i]), 4) for i in range(4)},
+                        "probabilities": {class_names[i]: round(float(probs[i]), 4) for i in range(len(class_names))},
                         "method": self._model_type,
+                        "model_version": "1.0",
                     },
                     model_identity=self._model_type,
-                    metrics={"max_probability": float(probs[pred_idx]), "signal_rms": float(np.sqrt(np.mean(sig**2)))},
+                    metrics={"max_probability": float(probs[pred_idx]),
+                             "signal_rms": float(np.sqrt(np.mean(sig**2)))},
                 )
             except Exception as e:
                 return AssetRunResult(
