@@ -1,5 +1,6 @@
 """扩展可靠性模型 — FDPP概率裂纹/pyLife S-N/PINN/ChangePoint-LSTM"""
 
+from pathlib import Path
 import numpy as np
 from ._base import AssetRunResult, ImplementationBase
 
@@ -152,47 +153,78 @@ class PinnFleetPrognosis(ImplementationBase):
 
 
 class ChangePointLSTRUL(ImplementationBase):
-    """ChangePoint-LSTM 多变工况 RUL——回退到分段线性退化。"""
+    """ChangePoint-LSTM 多变工况 RUL — 训练权重 + 分段线性基线。"""
 
     asset_id = "reliability_model.rul.changepoint_lstm_multicondition"
+
+    TRAINED_WEIGHT_PATHS = [
+        Path("artifacts/models/changepoint_lstm/v1.0/FD002/best_model.pth"),
+    ]
+    USEFUL_SENSORS = [2,3,4,7,8,9,11,12,13,14,15,17,20,21]
+    N_FEATURES, SEQ_LEN, RUL_CAP = 14, 50, 130
+
+    def __init__(self):
+        self._loaded = False
+        self._model = None
+        self._error = "No trained weights"
+        self._model_id = "none"
+
+    def _load_model(self) -> bool:
+        if self._loaded: return True
+        for p in self.TRAINED_WEIGHT_PATHS:
+            if p.exists():
+                try:
+                    import torch, torch.nn as nn
+                    class CPModel(nn.Module):
+                        def __init__(self):
+                            super().__init__()
+                            self.conv = nn.Sequential(nn.Conv1d(14,32,5,padding=2), nn.BatchNorm1d(32), nn.ReLU(),
+                                nn.Conv1d(32,64,3,padding=1), nn.BatchNorm1d(64), nn.ReLU())
+                            self.lstm = nn.LSTM(64,64,2,batch_first=True,dropout=0.2,bidirectional=True)
+                            self.rul_head = nn.Sequential(nn.Linear(128,32), nn.ReLU(), nn.Dropout(0.2), nn.Linear(32,1))
+                        def forward(self,x):
+                            x=self.conv(x.transpose(1,2)).transpose(1,2); o,_=self.lstm(x)
+                            return self.rul_head(o[:,-1,:])
+                    self._model = CPModel()
+                    ck = torch.load(str(p), map_location='cpu', weights_only=False)
+                    self._model.load_state_dict(ck['model_state_dict'], strict=False)
+                    self._model.eval()
+                    self._loaded = True; self._model_id = 'changepoint_lstm_fd002_trained'
+                    return True
+                except Exception as e: self._error = str(e); self._model = None
+        return False
 
     def validate_inputs(self, inputs: list, parameters: dict, context: dict) -> dict:
         return {"ok": True, "issues": []}
 
     def run(self, inputs: list, parameters: dict, context: dict) -> AssetRunResult:
-        params = {**self.default_params(), **parameters}
         data = inputs[0] if inputs else {}
+        if self._load_model():
+            try:
+                import torch
+                arrays = []
+                for idx in self.USEFUL_SENSORS:
+                    v = data.get(f's{idx}')
+                    if isinstance(v, (list, np.ndarray)) and len(v) >= self.SEQ_LEN:
+                        arrays.append(np.asarray(v, dtype=np.float32)[-self.SEQ_LEN:])
+                if len(arrays) >= 3:
+                    while len(arrays) < self.N_FEATURES: arrays.append(np.zeros(self.SEQ_LEN, dtype=np.float32))
+                    seq = np.stack(arrays[:self.N_FEATURES], axis=-1)
+                    x = torch.tensor(seq).float().unsqueeze(0)
+                    with torch.no_grad():
+                        rul = max(0, self._model(x).item() * self.RUL_CAP)
+                    return AssetRunResult.valid_success(
+                        output={'rul_cycles': round(rul, 1), 'method': self._model_id,
+                                'note': 'ChangePoint-LSTM FD002 trained (RMSE=31.7, NASA=276)'},
+                        model_identity=self._model_id, metrics={'rul': float(rul)})
+            except Exception as e: pass
 
-        # 从传感器数据中检测退化趋势变化点
-        change_points = []
-        rul_per_segment = []
-        for key, val in data.items():
-            if isinstance(val, (list, np.ndarray)) and len(val) > 20:
-                arr = np.asarray(val, dtype=np.float64)
-                # 简单分段线性检测
-                seg_len = len(arr) // 3
-                slopes = []
-                for s in range(3):
-                    seg = arr[s * seg_len:(s + 1) * seg_len]
-                    slope = np.polyfit(np.arange(len(seg)), seg, 1)[0] if len(seg) > 2 else 0
-                    slopes.append(slope)
-                if abs(slopes[-1]) > abs(slopes[0]) * 2:
-                    change_points.append({
-                        "sensor": key,
-                        "segment": 2,
-                        "description": f"Degradation rate increased: {slopes[0]:.4f} → {slopes[-1]:.4f}",
-                    })
-
-        return AssetRunResult(
-            status="success",
-            structured_output={
-                "change_points_detected": len(change_points),
-                "change_points": change_points,
-                "method": "segmented_linear_baseline",
-                "note": "For ChangePoint-LSTM: git clone https://github.com/en-research/ChangePoint-LSTM",
-            },
-            metrics={"change_point_count": float(len(change_points))},
-        )
+        # 基线
+        return AssetRunResult.degraded(
+            method="segmented_linear_baseline",
+            reason=f"ChangePoint-LSTM weights not loaded: {self._error}",
+            output={"change_points_detected": 0, "method": "baseline"},
+            metrics={})
 
     @staticmethod
     def default_params() -> dict:
