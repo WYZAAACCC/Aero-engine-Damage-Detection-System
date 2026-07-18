@@ -1,0 +1,11 @@
+best_epoch: 7
+hidden: 32
+model_id: faultsense_lstm_ae_fd001
+n_features: 14
+rul_cap: 130
+seq_len: 30
+subset: FD001
+test_nasa: 6.0
+test_rmse: 16.1
+threshold: 0.613097
+val_rmse: 16.4

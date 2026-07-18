@@ -1,0 +1,6 @@
+best_f1: 0.6334
+coreset_ratio: 0.1
+fpr: 0.3975
+image_auroc: 0.605
+model_id: patchcore_aebad_s
+threshold: 3.7509
