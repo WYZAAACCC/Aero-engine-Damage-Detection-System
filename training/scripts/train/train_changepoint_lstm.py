@@ -132,7 +132,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--data", default="artifacts/raw/cmapss")
     parser.add_argument("--subset", default="FD002")
-    parser.add_argument("--output", default="/f/aero-training/artifacts/models/changepoint_lstm/v1.0")
+    parser.add_argument("--output", default="artifacts/models/changepoint_lstm/v1.0")
     parser.add_argument("--epochs", type=int, default=50)
     parser.add_argument("--batch-size", type=int, default=128)
     parser.add_argument("--lr", type=float, default=1e-3)
