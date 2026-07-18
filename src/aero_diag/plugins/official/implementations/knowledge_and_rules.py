@@ -436,6 +436,21 @@ class RiskClassificationRules(ImplementationBase):
             risk_map = {"critical": "critical", "severe": "high", "moderate": "medium", "minor": "low"}
             risk = risk_map.get(severity)
 
+        # ── 审计修复: 组件不在任何矩阵条目中 → unknown ──
+        # 即使 severity 合法，如果 component 不匹配任何已知组件模式，
+        # 说明这是一个未知的诊断场景，不应走默认映射
+        if risk is not None and not rule_hit:
+            all_components_in_matrix = {comp for (_, comp), _ in self.RISK_MATRIX.items()}
+            # 标准化比较（处理空格/下划线不一致: HPT Blade vs HPT_blade）
+            comp_norm = component.lower().replace("_", " ").replace("  ", " ").strip()
+            component_matched = any(
+                c.lower().replace("_", " ") in comp_norm
+                or comp_norm in c.lower().replace("_", " ")
+                for c in all_components_in_matrix if c != "any"
+            )
+            if not component_matched:
+                risk = None  # 强制进入 unknown 分支
+
         # ── 审计修复 (AER-012): 未知组合返回 unknown，不是 medium ──
         if risk is None:
             return AssetRunResult(

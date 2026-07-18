@@ -60,6 +60,38 @@ dev = [
     "mypy>=1.0.0",
     "cryptography>=42",
 ]
+# ── 航空发动机损伤诊断领域依赖 (AER-018) ──
+aero = [
+    "fastapi>=0.100.0",
+    "uvicorn>=0.20.0",
+    "numpy>=1.24.0",
+    "scipy>=1.10.0",
+    "scikit-learn>=1.3.0",
+    "opencv-python-headless>=4.8.0",
+    "matplotlib>=3.7.0",
+]
+aero_dl = [
+    "torch>=2.0.0",
+    "torchvision>=0.15.0",
+    "ultralytics>=8.0.0",
+    "tensorflow>=2.13.0",
+    "segment-anything>=1.0",
+]
+aero_full = [
+    # 包含所有领域依赖
+    "fastapi>=0.100.0",
+    "uvicorn>=0.20.0",
+    "numpy>=1.24.0",
+    "scipy>=1.10.0",
+    "scikit-learn>=1.3.0",
+    "opencv-python-headless>=4.8.0",
+    "matplotlib>=3.7.0",
+    "torch>=2.0.0",
+    "torchvision>=0.15.0",
+    "ultralytics>=8.0.0",
+    "tensorflow>=2.13.0",
+    "segment-anything>=1.0",
+]
 
 [project.scripts]
 seekflow = "seekflow.cli:app"

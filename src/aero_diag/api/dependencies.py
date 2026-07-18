@@ -24,9 +24,21 @@ def get_task_service() -> TaskService:
 
 
 def get_asset_registry() -> AssetRegistry:
+    """获取全局 AssetRegistry 单例。
+
+    审计修复 (AER-017): 首次调用时自动注册所有官方资产，
+    确保 API 启动后资产搜索不为空。
+    """
     global _asset_registry
     if _asset_registry is None:
         _asset_registry = AssetRegistry()
+        # 自动注册所有官方资产
+        from aero_diag.plugins.official.register import register_all_official_assets
+        count = register_all_official_assets(_asset_registry)
+        import logging
+        logging.getLogger("aero_diag.api").info(
+            f"Auto-registered {count} official engineering assets on API startup"
+        )
     return _asset_registry
 
 
