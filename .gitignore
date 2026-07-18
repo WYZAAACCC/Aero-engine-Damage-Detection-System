@@ -50,3 +50,10 @@ trace_output.json
 # Dev scripts
 integration_test.py
 verify_reliability.py
+# Model weights (too large for git)
+*.pt
+*.pth
+# Data directory
+data/
+# API keys
+apikey.txt
