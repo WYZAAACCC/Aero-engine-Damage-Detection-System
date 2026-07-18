@@ -100,12 +100,32 @@ class AssetRunner:
 
         elapsed_ms = result.elapsed_ms or int((time.time() - t0) * 1000)
 
+        # ── 审计：检查结果是否诚实 ──
+        audit_warnings = []
+        if result.execution_status == "success" and result.validity_status == "degraded":
+            audit_warnings.append(
+                f"Asset '{asset_id}' returned degraded result — "
+                f"baseline/heuristic used, NOT suitable for safety decisions"
+            )
+        if result.execution_status == "unavailable":
+            audit_warnings.append(
+                f"Asset '{asset_id}' is UNAVAILABLE — model/weights missing"
+            )
+        if result.validity_status == "invalid":
+            audit_warnings.append(
+                f"Asset '{asset_id}' result is INVALID — do not use for decisions"
+            )
+
         return {
             "status": result.status,
+            "execution_status": result.execution_status,
+            "validity_status": result.validity_status,
+            "can_influence_decision": result.can_influence_decision,
             "asset_id": asset_id,
             "manifest": _manifest_summary(manifest),
             "result": result,
             "elapsed_ms": elapsed_ms,
+            "audit_warnings": audit_warnings if audit_warnings else None,
         }
 
     def is_available(self, asset_id: str) -> bool:
@@ -162,11 +182,17 @@ def _build_default_impl_registry() -> dict[str, Any]:
     registry = {}
 
     def _try_register(cls):
+        """审计修复: 加载失败必须记录错误，不能静默吞掉。"""
         try:
             inst = cls()
             registry[cls.asset_id] = inst
-        except Exception:
-            pass
+        except Exception as e:
+            import logging
+            logger = logging.getLogger("aero_diag.asset_runner")
+            logger.warning(
+                f"Asset implementation '{cls.asset_id}' failed to load: {e}. "
+                f"This asset will be UNAVAILABLE at runtime."
+            )
 
     # -- 预处理器 (3) --
     from .implementations.spectral import SpectralAnalysis; _try_register(SpectralAnalysis)

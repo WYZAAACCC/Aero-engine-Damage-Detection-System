@@ -64,8 +64,12 @@ class DataQualityGate(ImplementationBase):
             overall = "pass"
             recommendation = "proceed"
 
+        # ── 审计修复 (AER-011): 区分执行成功和数据质量结论 ──
+        is_usable = overall != "fail"
         return AssetRunResult(
-            status="success",
+            execution_status="success",  # 程序执行成功
+            validity_status="valid" if is_usable else "invalid",  # 数据质量结论
+            can_influence_decision=is_usable,
             structured_output={
                 "overall_status": overall,
                 "passed_count": pass_count,
@@ -73,6 +77,12 @@ class DataQualityGate(ImplementationBase):
                 "fail_count": fail_count,
                 "recommendation": recommendation,
                 "checks": results,
+                "note": (
+                    "Data quality check is surface-level only. "
+                    "Does NOT validate: dimensional consistency (pint), sensor calibration dates, "
+                    "operating condition alignment, borescope scale verification, "
+                    "material batch traceability, or maintenance record authenticity."
+                ),
             },
             metrics={
                 "pass_rate": pass_count / max(len(all_results), 1),
@@ -98,24 +108,63 @@ class DataQualityGate(ImplementationBase):
         return checks
 
     def _check_numerical(self, data: dict) -> list[dict]:
+        """审计修复 (AER-011): 标量数值必须进行范围检查，不能仅检查 NaN/Inf。"""
         checks = []
         numeric_fields = []
         for k, v in data.items():
             if isinstance(v, (int, float)):
-                numeric_fields.append((k, v))
+                numeric_fields.append((k, float(v)))
+                # 范围检查（物理合理性）
+                fv = float(v)
+                # 温度检查 (K or °C)
+                if any(tag in k.lower() for tag in ['temp', 't2', 't24', 't30', 't50', 'egt']):
+                    if fv < -100 or fv > 3000:
+                        checks.append({
+                            "category": "numerical", "field": k,
+                            "status": "fail",
+                            "message": f"温度 {fv} 超出物理合理范围 [-100, 3000]",
+                        })
+                # 压力检查
+                if any(tag in k.lower() for tag in ['press', 'p2', 'p15', 'p30']):
+                    if fv < 0:
+                        checks.append({
+                            "category": "numerical", "field": k,
+                            "status": "fail",
+                            "message": f"压力 {fv} 不能为负值",
+                        })
+                # 振动检查
+                if any(tag in k.lower() for tag in ['vib', 'vibration']):
+                    if fv < 0 or fv > 100:
+                        checks.append({
+                            "category": "numerical", "field": k,
+                            "status": "fail",
+                            "message": f"振动 {fv} 超出合理范围 [0, 100] ips",
+                        })
             elif isinstance(v, (list, np.ndarray)):
                 arr = np.asarray(v, dtype=np.float64)
+                if arr.size == 0:
+                    checks.append({
+                        "category": "numerical", "field": k,
+                        "status": "fail", "message": "数组为空",
+                    })
+                    continue
                 has_nan = bool(np.any(np.isnan(arr)))
                 has_inf = bool(np.any(np.isinf(arr)))
-                checks.append({
-                    "category": "numerical", "field": k,
-                    "status": "fail" if has_nan else "pass",
-                    "message": f"含 {np.sum(np.isnan(arr))} 个 NaN" if has_nan else "无 NaN",
-                })
+                is_constant = bool(np.all(arr == arr[0]))
+                if has_nan:
+                    checks.append({
+                        "category": "numerical", "field": k,
+                        "status": "fail", "message": f"含 {int(np.sum(np.isnan(arr)))} 个 NaN",
+                    })
                 if has_inf:
                     checks.append({
                         "category": "numerical", "field": k,
-                        "status": "fail", "message": f"含 Inf 值",
+                        "status": "fail", "message": "含 Inf 值",
+                    })
+                if is_constant and arr.size > 10:
+                    checks.append({
+                        "category": "numerical", "field": k,
+                        "status": "warn", "message": f"常量信号 (全部={arr[0]:.2f})",
                     })
         if not numeric_fields and not checks:
             checks.append({

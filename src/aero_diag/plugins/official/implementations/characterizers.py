@@ -33,44 +33,79 @@ class CrackGeometryMeasurement(ImplementationBase):
         data = inputs[0] if inputs else {}
 
         mask_data = data.get("mask", data.get("segmentation_mask_uri"))
-        bbox = data.get("bbox")  # [x, y, w, h] or [x1, y1, x2, y2]
+        bbox = data.get("bbox")  # 必须指定格式: bbox_format + bbox
+        bbox_format = data.get("bbox_format", "unknown")  # "xyxy" or "xywh"
         scale_info = data.get("scale_info", {})
 
-        # 从 bbox 估计尺寸
+        # ── 审计修复 (AER-010): 明确 bbox 格式，拒绝负宽度/负高度 ──
+        w, h = 0.0, 0.0
+
         if bbox and isinstance(bbox, (list, tuple)) and len(bbox) >= 4:
-            if len(bbox) == 4:
+            if bbox_format == "xyxy":
+                # [x1, y1, x2, y2]
+                x1, y1, x2, y2 = float(bbox[0]), float(bbox[1]), float(bbox[2]), float(bbox[3])
+                w, h = x2 - x1, y2 - y1
+            elif bbox_format == "xywh":
+                # [x, y, w, h]
                 w, h = float(bbox[2]), float(bbox[3])
-                if bbox[2] > 1.0:  # 判断是 [x,y,w,h] 还是 [x1,y1,x2,y2]
-                    w, h = float(bbox[2] - bbox[0]), float(bbox[3] - bbox[1])
             else:
-                w, h = 10.0, 10.0
-        elif mask_data is not None:
-            mask_arr = np.asarray(mask_data) if not isinstance(mask_data, str) else np.zeros((100, 100))
+                # 格式未知：报错而非猜测
+                return AssetRunResult(
+                    execution_status="failed", validity_status="invalid",
+                    error=(
+                        f"bbox_format must be 'xyxy' or 'xywh', got '{bbox_format}'. "
+                        "Ambiguous bbox format can produce negative area. "
+                        "Specify explicitly: {'bbox_format': 'xyxy', 'bbox': [x1,y1,x2,y2]}"
+                    ),
+                    structured_output={}, metrics={},
+                )
+
+            # 不变量检查
+            if w <= 0 or h <= 0:
+                return AssetRunResult(
+                    execution_status="failed", validity_status="invalid",
+                    error=f"Invalid bbox dimensions: width={w:.1f}, height={h:.1f}. Both must be > 0.",
+                    structured_output={}, metrics={},
+                )
+        elif mask_data is not None and not isinstance(mask_data, str):
+            mask_arr = np.asarray(mask_data)
             ys, xs = np.where(mask_arr > 0.5)
             if len(xs) > 0:
                 w, h = float(xs.max() - xs.min()), float(ys.max() - ys.min())
-            else:
-                w, h = 0.0, 0.0
-        else:
-            w, h = 0.0, 0.0
+        elif isinstance(mask_data, str) and mask_data:
+            # mask_uri 引用但未加载 — 警告
+            return AssetRunResult(
+                execution_status="success", validity_status="degraded",
+                can_influence_decision=False,
+                structured_output={
+                    "length_px": None, "width_px": None, "area_px2": None,
+                    "scale_available": False,
+                    "warning": "MASK_URI_NOT_LOADED — mask file referenced but not read from disk",
+                },
+                warnings=["Mask URI provided but file not loaded. Cannot measure geometry."],
+                metrics={},
+            )
 
-        # 标尺转换
+        # ── 标尺转换 ──
         scale_available = bool(scale_info.get("pixel_to_mm"))
         if scale_available:
-            px2mm = float(scale_info.get("pixel_to_mm", 0.05))
+            px2mm = float(scale_info["pixel_to_mm"])
+            if px2mm <= 0:
+                return AssetRunResult(
+                    execution_status="failed", validity_status="invalid",
+                    error=f"pixel_to_mm must be > 0, got {px2mm}",
+                    structured_output={}, metrics={},
+                )
             length_mm = max(w, h) * px2mm
             width_mm = min(w, h) * px2mm
             area_mm2 = w * h * px2mm ** 2
-            measurement_unit = "mm"
         else:
-            length_mm = None
-            width_mm = None
-            area_mm2 = None
-            measurement_unit = "pixel"
-            scale_available = False
+            length_mm, width_mm, area_mm2 = None, None, None
 
         return AssetRunResult(
-            status="success",
+            execution_status="success",
+            validity_status="degraded" if not scale_available else "valid",
+            can_influence_decision=bool(scale_available and w > 0 and h > 0),
             structured_output={
                 "length_px": round(max(w, h), 1),
                 "width_px": round(min(w, h), 1),
@@ -79,11 +114,18 @@ class CrackGeometryMeasurement(ImplementationBase):
                 "width_mm": round(width_mm, 3) if width_mm is not None else None,
                 "area_mm2": round(area_mm2, 3) if area_mm2 is not None else None,
                 "scale_available": scale_available,
-                "measurement_unit": measurement_unit,
+                "bbox_format": bbox_format,
                 "calibration_method": scale_info.get("calibration_method", "unknown"),
-                "warning": ("FABRICATE_MM_VALUES_FORBIDDEN" if not scale_available else None),
+                "note": (
+                    "Measurements are bbox-based, not skeleton-based. "
+                    "True crack length requires mask skeletonization (Zhang-Suen). "
+                    "mm values valid ONLY if scale calibration is current and verified."
+                ),
             },
-            warnings=["No scale reference — pixel output only. mm values FABRICATED if present."] if not scale_available else [],
+            warnings=(
+                ["No scale reference — pixel output only. mm values are None."]
+                if not scale_available else []
+            ),
             metrics={
                 "crack_length_px": max(w, h),
                 "crack_aspect_ratio": max(w, h) / max(min(w, h), 1),
@@ -157,13 +199,21 @@ class DamageTypeClassifier(ImplementationBase):
                 pass
 
         return AssetRunResult(
-            status="success",
+            execution_status="success",
+            validity_status="degraded",  # 关键词匹配不是真正的损伤分类
+            can_influence_decision=False,
             structured_output={
                 "damage_type": best,
                 "confidence": confidence,
                 "matched_keywords": matches,
                 "phenomenon": phenomenon[:200],
                 "alternatives": sorted(matches.items(), key=lambda x: -x[1])[1:4],
+                "method": "keyword_rule_engine",
+                "note": (
+                    "Keyword-based classification — NOT a trained classifier. "
+                    "score_semantics not used for classification. "
+                    "An anomaly_score of 0.95 ≠ 95% crack probability. "
+                ),
             },
             metrics={"match_count": float(len(matches)), "best_match_score": float(matches.get(best, 0))},
         )
@@ -215,14 +265,16 @@ class SeverityRater(ImplementationBase):
 
         length_mm = geometry.get("length_mm")
         area_mm2 = geometry.get("area_mm2")
+        # 审计修复: area_percent 需要总面积才能计算，不能直接用 area_mm2 和百分比比较
+        area_percent = geometry.get("area_percent")  # 显式传入的百分比
 
         rules = self.RULES.get(damage_type, {})
-        severity = "moderate"  # 默认
+        severity = "moderate"
         criteria = []
 
-        # 几何阈值评分
-        if "critical_length_mm" in rules and length_mm is not None:
-            if length_mm >= rules["critical_length_mm"]:
+        # ── 几何阈值评分 ──
+        if damage_type == "crack" and length_mm is not None:
+            if length_mm >= rules.get("critical_length_mm", 999):
                 severity = "critical"
                 criteria.append(f"length_{length_mm}mm_>=_critical_{rules['critical_length_mm']}mm")
             elif length_mm >= rules.get("severe_length_mm", 999):
@@ -235,31 +287,68 @@ class SeverityRater(ImplementationBase):
                 severity = "minor"
                 criteria.append(f"length_{length_mm}mm_below_all_thresholds")
 
-        if "critical_area_percent" in rules and area_mm2 is not None:
-            if area_mm2 >= rules["critical_area_percent"]:
-                severity = "critical"
-                criteria.append(f"area_{area_mm2}pct_>=_critical_{rules['critical_area_percent']}pct")
-            elif area_mm2 >= rules.get("severe_area_percent", 999):
-                severity = max(severity, "severe", key=lambda s: ["minor", "moderate", "severe", "critical"].index(s))
+        # 审计修复: 涂层剥落面积判断——必须使用百分比而非 mm²
+        if damage_type == "coating_spallation":
+            if area_percent is not None:
+                if area_percent >= rules.get("critical_area_percent", 999):
+                    severity = "critical"
+                    criteria.append(f"area_{area_percent}pct_>=_critical_{rules['critical_area_percent']}pct")
+                elif area_percent >= rules.get("severe_area_percent", 999):
+                    severity = "severe"
+                    criteria.append(f"area_{area_percent}pct_>=_severe_{rules['severe_area_percent']}pct")
+                elif area_percent >= rules.get("moderate_area_percent", 999):
+                    severity = "moderate"
+                    criteria.append(f"area_{area_percent}pct_>=_moderate_{rules['moderate_area_percent']}pct")
+                else:
+                    severity = "minor"
+                    criteria.append(f"area_{area_percent}pct_below_all_thresholds")
+            elif area_mm2 is not None:
+                # mm² 不能直接和百分比比较——需要知道叶片总面积
+                criteria.append(
+                    f"WARNING: area_mm2={area_mm2} provided but area_percent required for coating severity. "
+                    "Need total blade surface area to convert mm² to percentage."
+                )
+                # 保守处理：面积>10mm²标记为 moderate 并建议复检
+                if area_mm2 > 30:
+                    severity = "severe"
+                    criteria.append("large_absolute_area_conservative_escalation")
+                elif area_mm2 > 10:
+                    severity = "moderate"
+                    criteria.append("moderate_absolute_area_conservative")
 
-        # 部件关键性调整
-        comp_crit = self.COMPONENT_CRITICALITY.get(component)
-        if comp_crit == "critical" and severity == "moderate":
-            severity = "severe"
-            criteria.append("component_criticality_escalation")
-
+        # burn_mark: 始终 severe
         if "always" in rules:
             severity = rules["always"]
             criteria.append(f"always_{severity}_for_{damage_type}")
 
+        # 部件关键性调整
+        comp_crit = self.COMPONENT_CRITICALITY.get(component)
+        if comp_crit == "critical" and severity in ("moderate", "minor"):
+            severity = "severe"
+            criteria.append("component_criticality_escalation")
+
+        # ── 审计修复: 这些阈值没有绑定机型/部件/手册版本 ──
+        warnings = [
+            "Severity thresholds are generic defaults — NOT engine-model-specific, "
+            "NOT component-position-specific, NOT material-specific. "
+            "Do NOT use for real maintenance decisions without AMM/ESM validation.",
+        ]
+
         return AssetRunResult(
-            status="success",
+            execution_status="success",
+            validity_status="degraded",  # 审计: 通用阈值不能标记为 valid
+            can_influence_decision=False,
             structured_output={
                 "severity": severity,
                 "criteria_met": criteria,
                 "damage_type": damage_type,
                 "component": component,
                 "rule_version": "1.0",
+                "note": (
+                    "Generic severity thresholds — requires AMM/ESM validation "
+                    "for specific engine model, component position, and material."
+                ),
             },
+            warnings=warnings,
             metrics={"severity_ordinal": float(["minor", "moderate", "severe", "critical"].index(severity))},
         )

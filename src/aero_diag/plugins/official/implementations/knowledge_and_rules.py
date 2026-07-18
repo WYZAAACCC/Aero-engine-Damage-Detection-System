@@ -151,6 +151,8 @@ class OminKnowledgeSource(ImplementationBase):
         component = params.get("component") or ""
         damage = params.get("damage") or ""
         ktype = params.get("knowledge_type") or ""
+        engine_model = params.get("engine_model") or (inputs[0].get("engine_model", "") if inputs else "")
+        material = params.get("material") or (inputs[0].get("material", "") if inputs else "")
 
         # ── 跨域检查 ──
         cross_domain_warnings = self._check_cross_domain(query, component, damage)
@@ -160,7 +162,13 @@ class OminKnowledgeSource(ImplementationBase):
         query_lower = query.lower().replace("_", " ")
 
         results = []
+        engine_filter_applied = bool(engine_model)
+        material_filter_applied = bool(material)
+
         for item in self.KB:
+            score = 0
+            appl = item.get("applicability", {})
+            # ... (existing field parsing)
             score = 0
             appl = item.get("applicability", {})
 
@@ -209,6 +217,21 @@ class OminKnowledgeSource(ImplementationBase):
                     continue
                 score += 5  # 损伤类型精确匹配
 
+            # ── 审计修复 (AER-013): 发动机型号硬过滤 ──
+            if engine_model:
+                if engine_list and engine_list != [""] and "any" not in [e.lower() for e in engine_list]:
+                    if not any(engine_model.lower() in e.lower() for e in engine_list):
+                        continue  # 发动机型号不匹配 → 硬排除
+                    score += 5  # 发动机型号匹配
+
+            # ── 审计修复 (AER-013): 材料硬过滤 ──
+            if material:
+                if material_list and material_list != [""] and "any" not in [m.lower() for m in material_list]:
+                    mat_lower = material.lower().replace(" ", "_")
+                    if not any(mat_lower in m.lower().replace(" ", "_") for m in material_list):
+                        continue  # 材料不匹配 → 硬排除
+                    score += 5  # 材料匹配
+
             # ── 排除域检查 ──
             applicability_warning = ""
             if component and excl_component and excl_component != [""]:
@@ -218,6 +241,19 @@ class OminKnowledgeSource(ImplementationBase):
                         f"excludes this component context. {excl_note}"
                     )
                     score -= 10
+
+            # ── 审计修复: 材料排除 ──
+            excl_material = exclusions.get("material", [])
+            if isinstance(excl_material, str):
+                excl_material = [m.strip() for m in excl_material.split(",")]
+            if material and excl_material and excl_material != [""]:
+                for em in excl_material:
+                    if material.lower().replace(" ", "_") in em.lower().replace(" ", "_"):
+                        applicability_warning = (
+                            f"WARNING: knowledge '{item['knowledge_id']}' "
+                            f"excludes material '{material}'. {excl_note}"
+                        )
+                        score -= 10
 
             # ── 关键词匹配 ──
             title_lower = item["title"].lower()
@@ -258,7 +294,9 @@ class OminKnowledgeSource(ImplementationBase):
                 warning_count += 1
 
         return AssetRunResult(
-            status="success",
+            execution_status="success",
+            validity_status="degraded",  # 29条手写知识，非文档RAG
+            can_influence_decision=False,
             structured_output={
                 "results_found": len(results),
                 "knowledge_items": results[:max_results],
@@ -272,6 +310,21 @@ class OminKnowledgeSource(ImplementationBase):
                     "level_B": sum(1 for r in results if r.get("evidence_level") == "B"),
                 },
                 "cross_domain_warnings": cross_domain_warnings,
+                "filters_applied": {
+                    "component": bool(component),
+                    "damage_type": bool(damage),
+                    "engine_model": bool(engine_model),
+                    "material": bool(material),
+                    "knowledge_type": bool(ktype),
+                },
+                "note": (
+                    "29 hand-written knowledge items — NOT a document RAG system. "
+                    "24 of 29 self-labeled as evidence level A without approval process. "
+                    "Only 1 of 29 has source_location (page number). "
+                    "Most lack: page, table, section, document revision, effective date, "
+                    "file hash, original excerpt, and reviewer signature. "
+                    "DO NOT use for real maintenance decisions."
+                ),
             },
             metrics={
                 "result_count": float(len(results)),
@@ -352,15 +405,25 @@ class RiskClassificationRules(ImplementationBase):
         data = inputs[0]
         if not data.get("damage_type") and not data.get("severity"):
             return {"ok": False, "issues": ["damage_type or severity required"]}
-        return {"ok": True, "issues": []}
+        # 警告但不阻断——unknown severity 在 run() 中处理
+        issues = []
+        sev = data.get("severity", "")
+        valid_severities = {"minor", "moderate", "severe", "critical"}
+        if sev and sev not in valid_severities:
+            issues.append(
+                f"Severity '{sev}' not in standard set {valid_severities}. "
+                "Will be treated as unknown in risk classification."
+            )
+        return {"ok": True, "issues": issues}
 
     def run(self, inputs: list, parameters: dict, context: dict) -> AssetRunResult:
         data = inputs[0] if inputs else {}
-        severity = str(data.get("severity", "moderate"))
+        severity = str(data.get("severity", ""))
         component = str(data.get("component", data.get("component_location", "")))
+        damage_type = str(data.get("damage_type", ""))
 
         # 矩阵查找
-        risk = "medium"
+        risk = None  # 审计修复: 初始化为 None 而非 "medium"
         rule_hit = ""
         for (sev_pat, comp_pat), risk_level in self.RISK_MATRIX.items():
             if sev_pat == severity and (comp_pat == "any" or comp_pat.lower() in component.lower()):
@@ -368,10 +431,35 @@ class RiskClassificationRules(ImplementationBase):
                 rule_hit = f"{sev_pat}_{comp_pat}"
                 break
 
-        # 默认逻辑
+        # 默认逻辑 — 仅当 severity 在已知范围内
         if not rule_hit:
             risk_map = {"critical": "critical", "severe": "high", "moderate": "medium", "minor": "low"}
-            risk = risk_map.get(severity, "medium")
+            risk = risk_map.get(severity)
+
+        # ── 审计修复 (AER-012): 未知组合返回 unknown，不是 medium ──
+        if risk is None:
+            return AssetRunResult(
+                execution_status="success",
+                validity_status="degraded",
+                can_influence_decision=False,
+                structured_output={
+                    "risk_level": "unknown",
+                    "requires_review": True,
+                    "decision_blocked": True,
+                    "reason": (
+                        f"NO_APPLICABLE_APPROVED_RULE — "
+                        f"severity='{severity}', component='{component}', damage_type='{damage_type}'. "
+                        f"No matching rule in risk matrix. "
+                        f"Risk MUST NOT default to 'medium' for unknown combinations."
+                    ),
+                    "candidate_actions": ["engineering_evaluation"],
+                },
+                warnings=[
+                    "Unknown severity/component combination — risk classification blocked. "
+                    "Requires manual engineering evaluation, not automated default."
+                ],
+                metrics={"risk_ordinal": -1},
+            )
 
         actions = {
             "critical": ["immediate_shutdown", "engineering_evaluation"],
@@ -382,15 +470,21 @@ class RiskClassificationRules(ImplementationBase):
         }
 
         return AssetRunResult(
-            status="success",
+            execution_status="success",
+            validity_status="degraded",  # 审计: 通用规则不是验证过的
+            can_influence_decision=False,
             structured_output={
                 "risk_level": risk,
-                "rule_hit": rule_hit or "default",
-                "candidate_actions": actions.get(risk, ["increased_monitoring"]),
-                "requires_review": risk in ("critical", "high"),
+                "rule_hit": rule_hit or "default_severity_map",
+                "candidate_actions": actions.get(risk, ["engineering_evaluation"]),
+                "requires_review": True,  # 审计修复: 始终要求复核
                 "rule_version": "1.0",
+                "note": (
+                    "Generic risk matrix — NOT engine-model or component-position specific. "
+                    "May not match AMM/ESM risk criteria for specific inspection findings."
+                ),
             },
-            metrics={"risk_ordinal": float(["negligible", "low", "medium", "high", "critical"].index(risk))},
+            metrics={"risk_ordinal": float(["negligible", "low", "medium", "high", "critical"].index(risk) if risk in ["negligible", "low", "medium", "high", "critical"] else -1)},
         )
 
 
@@ -418,7 +512,9 @@ class InspectionIntervalRules(ImplementationBase):
         rec = intervals.get(risk_level, intervals["medium"])
 
         return AssetRunResult(
-            status="success",
+            execution_status="success",
+            validity_status="degraded",  # 硬编码值，非发动机型号特定
+            can_influence_decision=False,
             structured_output={
                 "recommended_interval_cycles": rec["interval_cycles"],
                 "action_type": rec["action"],
@@ -427,6 +523,13 @@ class InspectionIntervalRules(ImplementationBase):
                 "damage_type": damage_type,
                 "rule_version": "1.0",
                 "requires_dual_review": risk_level in ("critical", "high"),
+                "note": (
+                    "HARDCODED inspection intervals — NOT based on engine model, "
+                    "ATA chapter, specific component position, damage morphology, "
+                    "operating environment, load spectrum, OEM maintenance program, "
+                    "or Probability of Detection (POD). "
+                    "Fixed intervals MUST NOT be used for real maintenance planning."
+                ),
             },
             metrics={"interval_cycles": float(rec["interval_cycles"])},
         )

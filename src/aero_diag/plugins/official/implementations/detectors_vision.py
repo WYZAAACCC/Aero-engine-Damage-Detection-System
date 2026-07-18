@@ -155,9 +155,6 @@ class CA2AnomalyDetector(ImplementationBase):
         data = inputs[0] if inputs else {}
         img = data.get("image", data.get("data", data.get("image_uri")))
 
-        # 尝试加载模型
-        full_model = self._load_model(params)
-
         # 预处理图像
         try:
             if isinstance(img, str) and Path(img).exists():
@@ -168,32 +165,35 @@ class CA2AnomalyDetector(ImplementationBase):
             img_arr = _ensure_rgb(img_arr) if img_arr.ndim == 3 else img_arr.astype(np.float64)
             gray = np.mean(img_arr, axis=-1) if img_arr.ndim == 3 else img_arr
         except Exception:
-            return AssetRunResult(status="failed", structured_output={}, error="Cannot read image", metrics={})
+            return AssetRunResult(
+                execution_status="failed", validity_status="invalid",
+                structured_output={}, error="Cannot read image", metrics={},
+            )
 
-        # 完整模型推理
+        # 完整模型推理 — 仅当 CA² 仓库 + 权重均可用
+        full_model = self._load_model(params)
         if full_model:
             feat = self._extract_features(img_arr) if img_arr.ndim == 3 else None
             if feat is not None:
-                # 无参考特征 → 使用特征向量模长作为偏离度代理
-                score = float(np.linalg.norm(feat - feat))
-                # 实际场景：与正常图像特征库的 KNN 距离
-                return AssetRunResult(
-                    status="success",
-                    structured_output={
-                        "anomaly_detected": score > 5.0,
-                        "anomaly_score": round(min(score / 20, 1.0), 4),
-                        "feature_dim": len(feat),
-                        "method": "resnet50_knn_ca2_full",
-                        "device": self._device,
-                    },
-                    metrics={"anomaly_score": min(score / 20, 1.0), "feature_dim": len(feat)},
+                # 审计修复: feat - feat = 0 是明确的逻辑错误。
+                # 无正常样本特征库时，ResNet 特征无法做 KNN 异常检测。
+                # 返回 unavailable 而非伪造的 anomaly score。
+                return AssetRunResult.unavailable(
+                    reason="CA² requires a normal-feature reference library for KNN anomaly scoring. "
+                           "ResNet-50 feature extractor loaded but no reference features available. "
+                           "Provide a reference dataset of normal borescope images to enable anomaly detection.",
+                    model_identity="resnet50_no_reference",
+                    reason_code="NO_REFERENCE_FEATURE_LIBRARY",
                 )
 
-        # 基线回退
+        # 基线回退 — 明确标记为 degraded
         result = self._baseline(gray)
-        result["note"] = f"Baseline only — CA² full model not loaded: {self._model_error}"
-        return AssetRunResult(status="success", structured_output=result,
-                              metrics={"anomaly_score": result["anomaly_score"]})
+        return AssetRunResult.degraded(
+            method="statistical_baseline",
+            reason=f"CA² model unavailable: {self._model_error or 'pip install torch torchvision for ResNet-50'}",
+            output=result,
+            metrics={"anomaly_score": result["anomaly_score"]},
+        )
 
     @staticmethod
     def default_params() -> dict:
@@ -222,52 +222,47 @@ class SLFYOLODetector(ImplementationBase):
         self._device = "cpu"
 
     def _load_model(self, params: dict) -> bool:
+        """加载 SLF-YOLO 领域权重。拒绝通用 COCO 模型冒充。
+
+        审计修复 (AER-008): 通用 YOLO 不得冒充领域模型。
+        只有加载了 SLF-YOLO 专用权重（NEU-DET/GC10-DET 缺陷检测）才算 loaded。
+        """
         if self._model_loaded:
             return True
 
-        # 优先尝试 ultralytics YOLO（通用YOLOv8） → 再尝试 SLF-YOLO 特定
-        loaded = False
-
-        # 方案A：ultralytics YOLO（pip install ultralytics）
-        try:
-            from ultralytics import YOLO
-            weights = params.get("weights_path", "")
-            if not weights:
-                # 尝试预训练 yolov8n
-                self._model = YOLO("yolov8n.pt")
-            else:
-                self._model = YOLO(weights)
-            self._device = "cuda" if params.get("use_gpu", True) else "cpu"
-            loaded = True
-        except ImportError:
-            pass
-        except Exception:
-            pass
-
-        # 方案B：SLF-YOLO 仓库
-        if not loaded:
-            repo = _resolve_repo_path("SLF_YOLO_REPO_PATH", "SLF-YOLO")
-            if repo:
-                sys.path.insert(0, str(repo))
-                try:
-                    from ultralytics import YOLO
-                    weights = repo / "weights" / "best.pt"
-                    if weights.exists():
-                        self._model = YOLO(str(weights))
-                    else:
-                        self._model = YOLO("yolov8n.pt")
+        # 仅从 SLF-YOLO 仓库加载领域权重
+        repo = _resolve_repo_path("SLF_YOLO_REPO_PATH", "SLF-YOLO")
+        if repo:
+            sys.path.insert(0, str(repo))
+            try:
+                from ultralytics import YOLO
+                weights = repo / "weights" / "best.pt"
+                if weights.exists():
+                    self._model = YOLO(str(weights))
                     self._device = "cuda" if params.get("use_gpu", True) else "cpu"
-                    loaded = True
-                except Exception as e:
-                    self._model_error = str(e)
-                finally:
-                    if str(repo) in sys.path:
-                        sys.path.remove(str(repo))
+                    self._model_loaded = True
+                    self._model_type = "slf_yolo_domain"
+                    return True
+                else:
+                    self._model_error = (
+                        "SLF-YOLO repo found but no best.pt weights. "
+                        "Train on NEU-DET/GC10-DET metal surface defect dataset first."
+                    )
+            except ImportError:
+                self._model_error = "pip install ultralytics + SLF-YOLO weights required"
+            except Exception as e:
+                self._model_error = f"SLF-YOLO load failed: {e}"
+            finally:
+                if str(repo) in sys.path:
+                    sys.path.remove(str(repo))
+        else:
+            self._model_error = (
+                "SLF-YOLO domain weights not found. "
+                "git clone https://github.com/zacianfans/SLF-YOLO and train on metal surface defect dataset. "
+                "Generic COCO-pretrained YOLO is NOT a substitute for domain defect detection."
+            )
 
-        self._model_loaded = loaded
-        if not loaded and not self._model_error:
-            self._model_error = "pip install ultralytics for YOLOv8"
-        return loaded
+        return False
 
     def _baseline(self, gray: np.ndarray) -> list[dict]:
         """Sobel 梯度基线。"""
@@ -291,14 +286,10 @@ class SLFYOLODetector(ImplementationBase):
 
         try:
             img_arr = np.asarray(img) if not isinstance(img, str) else None
-            if img_arr is not None:
-                gray = np.mean(img_arr, axis=-1) if img_arr.ndim == 3 else img_arr.astype(np.float64)
-            else:
-                gray = None
 
-            # 完整模型
+            # 完整模型 — 仅当 SLF-YOLO 领域权重加载成功
             if self._load_model(params) and img_arr is not None:
-                rgb = _ensure_rgb(img_arr) if img_arr.ndim in (2, 3) else np.stack([gray]*3, axis=-1)
+                rgb = _ensure_rgb(img_arr) if img_arr.ndim in (2, 3) else np.stack([np.mean(img_arr, axis=-1)]*3, axis=-1)
                 try:
                     results = self._model(rgb, conf=params.get("confidence_threshold", 0.25),
                                           device=self._device, verbose=False)
@@ -310,22 +301,40 @@ class SLFYOLODetector(ImplementationBase):
                                 "confidence": round(float(box.conf[0]), 4),
                                 "bbox": box.xyxy[0].tolist(),
                             })
-                    return AssetRunResult(status="success",
-                        structured_output={"defects_found": len(defects), "defects": defects,
-                                           "method": "yolov8_full", "device": self._device},
-                        metrics={"defect_count": float(len(defects))})
+                    return AssetRunResult.valid_success(
+                        output={"defects_found": len(defects), "defects": defects,
+                                "method": "slf_yolo_domain", "device": self._device},
+                        model_identity="slf_yolo_domain",
+                        metrics={"defect_count": float(len(defects))},
+                    )
                 except Exception as e:
-                    self._model_error = str(e)
+                    return AssetRunResult(
+                        execution_status="failed", validity_status="invalid",
+                        error=f"SLF-YOLO inference failed: {e}",
+                        structured_output={}, metrics={},
+                    )
 
-            defects = self._baseline(gray) if gray is not None else []
-            return AssetRunResult(status="success",
-                structured_output={"defects_found": len(defects), "defects": defects,
-                                   "method": "edge_gradient_baseline",
-                                   "note": f"YOLO not loaded: {self._model_error}"},
-                metrics={"defect_count": float(len(defects))})
+            # 无领域权重 → unavailable（不使用 COCO 模型冒充）
+            if img_arr is not None:
+                gray = np.mean(img_arr, axis=-1) if img_arr.ndim == 3 else img_arr.astype(np.float64)
+                defects = self._baseline(gray)
+                return AssetRunResult.degraded(
+                    method="edge_gradient_baseline",
+                    reason=f"SLF-YOLO domain weights unavailable: {self._model_error}",
+                    output={"defects_found": len(defects), "defects": defects},
+                    metrics={"defect_count": float(len(defects))},
+                )
+
+            return AssetRunResult.unavailable(
+                reason="No image data provided",
+                reason_code="NO_INPUT_DATA",
+            )
 
         except Exception as e:
-            return AssetRunResult(status="failed", error=str(e), structured_output={}, metrics={})
+            return AssetRunResult(
+                execution_status="failed", validity_status="invalid",
+                error=str(e), structured_output={}, metrics={},
+            )
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -420,31 +429,57 @@ class SAMAdapterCrackSegmentation(ImplementationBase):
             if img_arr is not None:
                 img_arr = _ensure_rgb(img_arr) if img_arr.ndim == 3 else img_arr
 
-            # 完整 SAM 推理
+            # 完整 SAM 推理 — 需要 SAM 权重 + 裂纹专用 Adapter/LoRA
             if self._load_model(params) and img_arr is not None:
                 self._predictor.set_image(img_arr)
-                # 中心点提示
+                # 审计修复: 中心点提示不是裂纹检测——需要上游检测器提供裂纹候选点/框。
+                # 没有裂纹 Adapter/LoRA 权重时，标准 SAM 不能做裂纹分割。
                 h, w = img_arr.shape[:2]
                 point = np.array([[w // 2, h // 2]])
                 label = np.array([1])
-                masks, scores, _ = self._predictor.predict(point_coords=point, point_labels=label, multimask_output=True)
+                masks, scores, _ = self._predictor.predict(
+                    point_coords=point, point_labels=label, multimask_output=True,
+                )
                 best_idx = np.argmax(scores)
                 mask = masks[best_idx]
                 ratio = float(np.sum(mask) / mask.size)
-                return AssetRunResult(status="success",
-                    structured_output={"crack_detected": bool(ratio > 0.005), "crack_pixel_ratio": round(ratio, 6),
-                                       "mask_resolution": list(mask.shape), "sam_score": float(scores[best_idx]),
-                                       "method": "sam_full", "device": self._device},
-                    metrics={"crack_pixel_ratio": ratio})
+                return AssetRunResult.degraded(
+                    method="sam_center_prompt",
+                    reason=(
+                        "Standard SAM with center-point prompt — NOT crack-specific segmentation. "
+                        "SAM-Crack Adapter/LoRA weights not loaded. "
+                        "Center-point prompt segments the most salient object, not necessarily a crack. "
+                        "git clone https://github.com/sky-visionX/CrackSegmentation for crack-specific weights."
+                    ),
+                    output={
+                        "crack_detected": bool(ratio > 0.005),
+                        "crack_pixel_ratio": round(ratio, 6),
+                        "mask_resolution": list(mask.shape),
+                        "sam_score": float(scores[best_idx]),
+                        "method": "sam_center_prompt_degraded",
+                        "device": self._device,
+                    },
+                    metrics={"crack_pixel_ratio": ratio},
+                )
 
+            # Canny 基线 — 任何结构边缘都可能成为"裂纹"
             result = self._canny_baseline(img_arr) if img_arr is not None else {"crack_detected": False, "crack_pixel_ratio": 0.0}
-            result["method"] = "canny_edge_baseline"
-            result["note"] = f"SAM not loaded: {self._error}"
-            return AssetRunResult(status="success", structured_output=result,
-                                  metrics={"crack_pixel_ratio": result["crack_pixel_ratio"]})
+            return AssetRunResult.degraded(
+                method="canny_edge_baseline",
+                reason=(
+                    f"Canny edge detection — NOT crack segmentation. "
+                    f"Any structural edge (reflections, coating textures, blade contours) may be misidentified as crack. "
+                    f"SAM not loaded: {self._error}"
+                ),
+                output=result,
+                metrics={"crack_pixel_ratio": result["crack_pixel_ratio"]},
+            )
 
         except Exception as e:
-            return AssetRunResult(status="failed", error=str(e), structured_output={}, metrics={})
+            return AssetRunResult(
+                execution_status="failed", validity_status="invalid",
+                error=str(e), structured_output={}, metrics={},
+            )
 
     @staticmethod
     def default_params() -> dict:
@@ -460,105 +495,33 @@ class EGCIENetSegmentation(ImplementationBase):
     """EGCIENet SAM 引导叶片缺陷分割。
 
     完整模型: git clone https://github.com/Newbiejy/EGCIENet_In-service-blade-defect-detection
-    加载 SegFormer + SAM 边缘引导权重 → 多类别分割掩膜。
+    需要 SegFormer + SAM 边缘引导权重 → 多类别分割掩膜。
 
-    基线: 图像统计分析。如果 pip install ultralytics，使用 YOLOv8-seg 增强。
+    审计修复 (AER-008): YOLOv8-seg 不是 EGCIENet。权重缺失时返回 unavailable。
     """
 
     asset_id = "detector.borescope.egcienet_segmentation"
 
     def __init__(self):
         self._loaded = False
-        self._error = ""
-        self._yolo_seg = None
+        self._error = (
+            "EGCIENet domain weights not available. "
+            "Requires: git clone https://github.com/Newbiejy/EGCIENet_In-service-blade-defect-detection "
+            "and trained SegFormer + SAM edge-guidance weights. "
+            "Generic YOLOv8-seg is NOT EGCIENet and does not provide blade-specific defect segmentation."
+        )
 
     def _load_model(self, params: dict) -> bool:
+        """EGCIENet 需要其专用权重。YOLOv8-seg 不能替代。"""
         if self._loaded:
             return True
-        # 使用 YOLOv8-seg 作为可用的分割替代（EGCIENet 权重未公开的情况下）
-        try:
-            from ultralytics import YOLO
-            self._yolo_seg = YOLO("yolov8n-seg.pt")
-            self._loaded = True
-            return True
-        except ImportError:
-            self._error = "pip install ultralytics for YOLOv8-seg baseline; EGCIENet weights: github.com/Newbiejy/EGCIENet"
-        except Exception as e:
-            self._error = str(e)
-        return False
-
-    def validate_inputs(self, inputs: list, parameters: dict, context: dict) -> dict:
-        return {"ok": True, "issues": []}
-
-    def run(self, inputs: list, parameters: dict, context: dict) -> AssetRunResult:
-        params = {**self.default_params(), **parameters}
-        data = inputs[0] if inputs else {}
-        img = data.get("image", data.get("data"))
-
-        try:
-            img_arr = np.asarray(img) if not isinstance(img, str) else None
-
-            if self._load_model(params) and img_arr is not None:
-                rgb = _ensure_rgb(img_arr) if img_arr.ndim == 3 else np.stack([img_arr]*3, axis=-1)
-                results = self._yolo_seg(rgb, conf=0.25, verbose=False)
-                segments = []
-                for r in results:
-                    if r.masks is not None:
-                        for i, mask in enumerate(r.masks.data):
-                            segments.append({"class": int(r.boxes.cls[i]) if r.boxes is not None else -1,
-                                             "mask_area_px": int(mask.sum().item()),
-                                             "bbox": r.boxes.xyxy[i].tolist() if r.boxes is not None else []})
-                return AssetRunResult(status="success",
-                    structured_output={"defects_found": len(segments), "segments": segments,
-                                       "method": "yolov8_seg", "note": "YOLOv8-seg (EGCIENet alternative)"},
-                    metrics={"defect_count": float(len(segments))})
-
-            if img_arr is not None:
-                stats = {"mean": float(np.mean(img_arr)), "std": float(np.std(img_arr)),
-                         "min": float(np.min(img_arr)), "max": float(np.max(img_arr))}
-                return AssetRunResult(status="partial",
-                    structured_output={"method": "image_statistics_baseline", "stats": stats,
-                                       "note": f"EGCIENet/YOLO not loaded: {self._error}"}, metrics=stats)
-
-            return AssetRunResult(status="partial", structured_output={"method": "no_data"}, metrics={})
-
-        except Exception as e:
-            return AssetRunResult(status="failed", error=str(e), structured_output={}, metrics={})
-
-
-# ═══════════════════════════════════════════════════════════════════════
-# TS-SAM 双流通用分割 — 完整：Dual-Stream SAM | 基线：YOLOv8-seg
-# ═══════════════════════════════════════════════════════════════════════
-
-class TSSAMSegmentation(ImplementationBase):
-    """TS-SAM 双流通用分割。
-
-    完整模型: git clone https://github.com/maoyangou147/TS-SAM
-    加载双流SAM (CSA+MRM+FFD) → 多类别分割。
-
-    回退: YOLOv8-seg → Canny。
-    """
-
-    asset_id = "detector.general.ts_sam_segmentation"
-
-    def __init__(self):
-        self._loaded = False
-        self._error = ""
-        self._yolo_seg = None
-
-    def _load_model(self, params: dict) -> bool:
-        if self._loaded:
-            return True
-        # TS-SAM 权重约2.4GB — 先尝试ultralytics YOLO作为轻量替代
-        try:
-            from ultralytics import YOLO
-            self._yolo_seg = YOLO("yolov8n-seg.pt")
-            self._loaded = True
-            return True
-        except ImportError:
-            self._error = "TS-SAM requires SAM ViT-H (~2.4GB). YOLOv8-seg alternative: pip install ultralytics"
-        except Exception as e:
-            self._error = str(e)
+        # EGCIENet 权重未公开下载 → 始终不可用
+        repo = _resolve_repo_path("EGCIENET_REPO_PATH", "EGCIENet_In-service-blade-defect-detection")
+        if repo:
+            self._error = (
+                "EGCIENet repo found but trained weights required. "
+                "Train SegFormer + SAM edge-guidance on blade defect dataset first."
+            )
         return False
 
     def validate_inputs(self, inputs: list, parameters: dict, context: dict) -> dict:
@@ -569,19 +532,88 @@ class TSSAMSegmentation(ImplementationBase):
         img = data.get("image", data.get("data"))
 
         if self._load_model({}) and img is not None:
-            try:
-                img_arr = np.asarray(img) if not isinstance(img, str) else None
-                if img_arr is not None:
-                    rgb = _ensure_rgb(img_arr) if img_arr.ndim == 3 else np.stack([img_arr]*3, axis=-1)
-                    results = self._yolo_seg(rgb, conf=0.25, verbose=False)
-                    segments = sum(1 for r in results if r.masks is not None for _ in r.masks.data)
-                    return AssetRunResult(status="success",
-                        structured_output={"defect_segments": segments, "method": "yolov8_seg",
-                                           "note": "YOLOv8-seg fallback — TS-SAM ViT-H requires GPU"},
-                        metrics={"segment_count": float(segments)})
-            except Exception:
-                pass
+            pass  # 不会到达（当前无权重）
 
-        return AssetRunResult(status="partial",
-            structured_output={"method": "unavailable", "note": f"TS-SAM/YOLO not loaded: {self._error}"},
-            metrics={})
+        # 权重缺失 → unavailable
+        img_arr = np.asarray(img) if not isinstance(img, str) else None
+        if img_arr is not None:
+            stats = {"mean": float(np.mean(img_arr)), "std": float(np.std(img_arr)),
+                     "min": float(np.min(img_arr)), "max": float(np.max(img_arr))}
+            return AssetRunResult.degraded(
+                method="image_statistics_only",
+                reason=self._error,
+                output={"stats": stats},
+                metrics=stats,
+            )
+
+        return AssetRunResult.unavailable(
+            reason=self._error,
+            reason_code="MODEL_WEIGHTS_UNAVAILABLE",
+        )
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# TS-SAM 双流通用分割 — 完整：Dual-Stream SAM | 基线：YOLOv8-seg
+# ═══════════════════════════════════════════════════════════════════════
+
+class TSSAMSegmentation(ImplementationBase):
+    """TS-SAM 双流通用分割。
+
+    完整模型: git clone https://github.com/maoyangou147/TS-SAM
+    需要双流SAM (CSA+MRM+FFD) 权重 (~2.4GB ViT-H)。
+
+    审计修复 (AER-008): YOLOv8-seg 不是 TS-SAM。
+    """
+
+    asset_id = "detector.general.ts_sam_segmentation"
+
+    def __init__(self):
+        self._loaded = False
+        self._error = (
+            "TS-SAM requires SAM ViT-H (~2.4GB) + Dual-Stream CSA+MRM+FFD weights. "
+            "git clone https://github.com/maoyangou147/TS-SAM for model code. "
+            "Generic YOLOv8-seg is NOT TS-SAM."
+        )
+
+    def _load_model(self, params: dict) -> bool:
+        if self._loaded:
+            return True
+        # TS-SAM 需要 SAM ViT-H 基础权重 + TS-SAM 专用适配权重
+        repo = _resolve_repo_path("TS_SAM_REPO_PATH", "TS-SAM")
+        if repo:
+            sam_checkpoint = params.get("sam_checkpoint", os.environ.get("SAM_CHECKPOINT", ""))
+            if sam_checkpoint and Path(sam_checkpoint).exists():
+                try:
+                    from segment_anything import sam_model_registry
+                    import torch
+                    self._model = sam_model_registry["vit_h"](checkpoint=sam_checkpoint)
+                    self._device = "cuda" if torch.cuda.is_available() else "cpu"
+                    self._model.to(self._device)
+                    self._loaded = True
+                    return True
+                except Exception as e:
+                    self._error = f"TS-SAM load failed: {e}"
+            else:
+                self._error = "TS-SAM requires SAM ViT-H checkpoint + TS-SAM adapter weights"
+        return False
+
+    def validate_inputs(self, inputs: list, parameters: dict, context: dict) -> dict:
+        return {"ok": True, "issues": []}
+
+    def run(self, inputs: list, parameters: dict, context: dict) -> AssetRunResult:
+        data = inputs[0] if inputs else {}
+        img = data.get("image", data.get("data"))
+
+        if self._load_model({}) and img is not None:
+            # SAM 基础模型已加载但缺少 TS-SAM adapter → degraded
+            return AssetRunResult.degraded(
+                method="sam_base_no_ts_adapter",
+                reason="SAM ViT-H loaded but TS-SAM Dual-Stream adapter weights missing",
+                output={"defect_segments": 0, "note": "TS-SAM adapter weights required for domain segmentation"},
+                metrics={"segment_count": 0},
+            )
+
+        return AssetRunResult.unavailable(
+            reason=self._error,
+            reason_code="MODEL_WEIGHTS_UNAVAILABLE",
+        )

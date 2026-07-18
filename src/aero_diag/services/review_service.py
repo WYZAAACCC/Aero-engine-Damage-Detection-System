@@ -45,7 +45,19 @@ class ReviewService:
         comments: str = "",
         conditions: list[str] | None = None,
     ) -> ReviewDecision | None:
-        """批准决策草案。"""
+        """批准决策草案。
+
+        审计修复 (AER-016, P0-5): 拒绝匿名审批。
+        在认证系统实现之前，明确标记审批为未验证。
+        """
+        # ── 审计修复: 拒绝空审核人 ──
+        if not reviewer or not reviewer.strip():
+            raise ValueError(
+                "APPROVAL DENIED: reviewer identity must not be empty. "
+                "Anonymous/string-only approval is NOT accepted for safety-critical decisions. "
+                "In production, reviewer must come from an authenticated identity system."
+            )
+
         reviews = self._reviews.get(draft_id, [])
         if not reviews:
             return None
@@ -60,10 +72,21 @@ class ReviewService:
             conditions=conditions or [],
             reviewer=reviewer,
             reviewer_role=reviewer_role,
+            reviewer_credentials="UNVERIFIED — identity system not integrated",
             evidence_package_id=latest.evidence_package_id,
             version=latest.version + 1,
             supersedes_review_id=latest.review_id,
+            signature_hash="UNSIGNED — digital signature not implemented",
         )
+        # ── 审计修复: 警告未验证的审批 ──
+        new_review.comments = (
+            f"{comments}\n\n"
+            f"[AUDIT WARNING] This approval is NOT cryptographically signed. "
+            f"Reviewer identity '{reviewer}' is NOT verified against an identity provider. "
+            f"In production, approvals require: OIDC authentication, role authorization, "
+            f"digital signature over the complete evidence package."
+        ).strip()
+
         self._reviews[draft_id].append(new_review)
         return new_review
 

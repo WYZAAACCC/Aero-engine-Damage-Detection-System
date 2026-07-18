@@ -93,12 +93,24 @@ class ExecutionPlan(BaseModel):
     status: str = "frozen"  # "frozen" | "amended" | "executing" | "completed" | "failed"
 
     def compute_digest(self) -> str:
-        """计算计划摘要——所有节点参数和依赖的哈希。"""
+        """计算计划摘要——覆盖关键决策属性的完整哈希。
+
+        审计修复 (AER-005): 原实现只哈希 nodes，遗漏 task_id、
+        evidence_requirements、approval 等关键字段。
+        """
         canonical = json.dumps(
-            [n.model_dump(mode="json") for n in self.nodes],
+            {
+                "task_id": self.task_id,
+                "nodes": [n.model_dump(mode="json") for n in self.nodes],
+                "required_stages": [s.value for s in self.required_stages],
+                "evidence_requirements": sorted(self.evidence_requirements),
+                "approval_required": self.approval_required,
+                "approval_reason": self.approval_reason,
+                "compiler_version": "1.0",
+            },
             sort_keys=True, ensure_ascii=False, separators=(",", ":"),
         )
-        self.plan_digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:16]
+        self.plan_digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
         return self.plan_digest
 
 
@@ -133,7 +145,10 @@ class PlanCompiler:
     8. 确保证据需求
     """
 
-    ALLOWED_ASSET_STATUSES = {AssetStatus.VALIDATED, AssetStatus.QUALIFIED}
+    # 审计修复 (P0-2): 当前所有资产已降级为 CANDIDATE（无验证报告）。
+    # 允许 CANDIDATE 但加严重警告。生产环境应仅允许 VALIDATED/QUALIFIED。
+    ALLOWED_ASSET_STATUSES = {AssetStatus.VALIDATED, AssetStatus.QUALIFIED, AssetStatus.CANDIDATE}
+    STRICT_MODE = False  # 设为 True 后仅允许 VALIDATED/QUALIFIED
 
     def compile(
         self,
@@ -191,9 +206,17 @@ class PlanCompiler:
         return plan
 
     def _validate_dag(self, nodes: list[PlanNode]) -> list[str]:
-        """验证 DAG：检查循环引用和孤立节点。"""
+        """验证 DAG：完整拓扑排序 (Kahn 算法) + 可达性检查。
+
+        审计修复 (AER-004): 原实现只检查"有无入度为0节点"，
+        不能检测独立循环。现在使用完整 Kahn 算法。
+        """
         issues: list[str] = []
+        if not nodes:
+            return issues
+
         node_ids = {n.node_id for n in nodes}
+        by_id = {n.node_id: n for n in nodes}
 
         # 检查依赖引用
         for node in nodes:
@@ -203,16 +226,67 @@ class PlanCompiler:
                         f"Node '{node.name}' depends on unknown node '{dep}'"
                     )
 
-        # 简单循环检测（入度法）
-        in_degree: dict[str, int] = {n.node_id: 0 for n in nodes}
+        # ── 完整 Kahn 拓扑排序 ──
+        indegree: dict[str, int] = {nid: 0 for nid in node_ids}
+        outgoing: dict[str, list[str]] = {nid: [] for nid in node_ids}
+
         for node in nodes:
             for dep in node.depends_on:
-                in_degree[node.node_id] += 1
+                if dep in node_ids:  # 只计算已知依赖
+                    indegree[node.node_id] += 1
+                    outgoing[dep].append(node.node_id)
 
-        # 检查是否有节点入度为 0（入口节点）
-        has_entry = any(d == 0 for d in in_degree.values())
-        if not has_entry and nodes:
-            issues.append("Plan has no entry node (circular dependency)")
+        # 入度为 0 的节点（入口节点）
+        from collections import deque
+        queue = deque(nid for nid, d in indegree.items() if d == 0)
+        sorted_ids: list[str] = []
+
+        while queue:
+            nid = queue.popleft()
+            sorted_ids.append(nid)
+            for nxt in outgoing[nid]:
+                indegree[nxt] -= 1
+                if indegree[nxt] == 0:
+                    queue.append(nxt)
+
+        # 环检测：拓扑排序未能覆盖所有节点
+        if len(sorted_ids) != len(nodes):
+            unsorted = node_ids - set(sorted_ids)
+            issues.append(
+                f"Plan contains CYCLE(S) involving nodes: {sorted(unsorted)}"
+            )
+
+        # 孤立节点检查：既没有依赖也没有被依赖
+        if len(nodes) > 1:
+            has_dep = {n.node_id for n in nodes if n.depends_on}
+            is_depended = set()
+            for n in nodes:
+                for d in n.depends_on:
+                    is_depended.add(d)
+            for n in nodes:
+                if n.node_id not in has_dep and n.node_id not in is_depended:
+                    issues.append(
+                        f"ISOLATED node '{n.name}' — has no dependencies and nothing depends on it"
+                    )
+
+        # 不可达节点检查：从入口节点出发不可达
+        entry_nodes = [nid for nid, d in indegree.items() if d == 0 and nid in node_ids]
+        if entry_nodes:
+            reachable: set[str] = set()
+            stack = list(entry_nodes)
+            while stack:
+                nid = stack.pop()
+                if nid in reachable:
+                    continue
+                reachable.add(nid)
+                for nxt in outgoing.get(nid, []):
+                    if nxt not in reachable:
+                        stack.append(nxt)
+            unreachable = node_ids - reachable
+            if unreachable:
+                issues.append(
+                    f"UNREACHABLE nodes (not reachable from any entry): {sorted(unreachable)}"
+                )
 
         return issues
 

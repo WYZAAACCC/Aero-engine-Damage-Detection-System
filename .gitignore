@@ -50,6 +50,7 @@ trace_output.json
 # Dev scripts
 integration_test.py
 verify_reliability.py
+test_integrity.py
 # Model weights (too large for git)
 *.pt
 *.pth

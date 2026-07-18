@@ -653,7 +653,7 @@ ASSET_CA2_ANOMALY_DETECTOR = EngineeringAssetManifest(
     asset_id="detector.borescope.ca2_anomaly",
     name="CA² 无监督孔探叶片异常检测器",
     version="1.0.0", asset_kind=AssetKind.DETECTOR,
-    publisher="changniu54 (USTC)", status=AssetStatus.VALIDATED,
+    publisher="changniu54 (USTC)", status=AssetStatus.CANDIDATE,
     description=(
         "基于类无关自适应特征适应的无监督异常检测。"
         "训练无需缺陷样本——仅用正常叶片图像完成特征聚类，检测时计算距离。"
@@ -704,7 +704,7 @@ ASSET_EGCIENET_SEGMENTATION = EngineeringAssetManifest(
     asset_id="detector.borescope.egcienet_segmentation",
     name="EGCIENet SAM 引导叶片缺陷分割网络",
     version="1.0.0", asset_kind=AssetKind.DETECTOR,
-    publisher="Newbiejy", status=AssetStatus.VALIDATED,
+    publisher="Newbiejy", status=AssetStatus.CANDIDATE,
     description=(
         "SegFormer + SAM 边缘引导的 in-service 叶片缺陷分割网络。"
         "利用 SAM 全局边缘特征引导，处理反光和域内变化。"
@@ -754,7 +754,7 @@ ASSET_SLF_YOLO_METAL_DEFECT = EngineeringAssetManifest(
     asset_id="detector.surface.slf_yolo_metal_defect",
     name="SLF-YOLO 金属表面缺陷检测器 (YOLOv8增强)",
     version="1.0.0", asset_kind=AssetKind.DETECTOR,
-    publisher="zacianfans", status=AssetStatus.VALIDATED,
+    publisher="zacianfans", status=AssetStatus.CANDIDATE,
     description=(
         "基于增强 YOLOv8 的金属表面缺陷检测。轻量化设计(SC_C2f + Light-SSF_Neck + FIMetal-IoU)。"
         "NEU-DET 80.0% mAP, AL10-DET 86.8% mAP。适合资源受限的工业环境。"
@@ -807,7 +807,7 @@ ASSET_SAM_ADAPTER_CRACK = EngineeringAssetManifest(
     asset_id="detector.crack.sam_adapter_segmentation",
     name="SAM-Adapter 裂纹分割器 (LoRA/Adapter微调)",
     version="1.0.0", asset_kind=AssetKind.DETECTOR,
-    publisher="sky-visionX / multi-authors", status=AssetStatus.VALIDATED,
+    publisher="sky-visionX / multi-authors", status=AssetStatus.CANDIDATE,
     description=(
         "基于 SAM (Segment Anything Model) + Adapter/LoRA 微调的裂纹分割。"
         "仅微调 ~1% 参数，保持 SAM 的强零样本泛化能力。"
@@ -862,7 +862,7 @@ ASSET_TS_SAM_SEGMENTATION = EngineeringAssetManifest(
     asset_id="detector.general.ts_sam_segmentation",
     name="TS-SAM 双流通用缺陷分割器",
     version="1.0.0", asset_kind=AssetKind.DETECTOR,
-    publisher="maoyangou147", status=AssetStatus.VALIDATED,
+    publisher="maoyangou147", status=AssetStatus.CANDIDATE,
     description=(
         "双流 SAM 分割器：卷积侧适配器(CSA)+多尺度优化模块(MRM)+特征融合解码器(FFD)。"
         "10 个公共数据集验证，跨 3 类任务，超越 SAM-Adapter。"
@@ -908,7 +908,7 @@ ASSET_WCAMBA_BEARING_FAULT = EngineeringAssetManifest(
     asset_id="detector.vibration.wcamba_bearing_fault",
     name="WCamba 航空轴承故障诊断器 (轻量 CNN+Mamba)",
     version="1.0.0", asset_kind=AssetKind.DETECTOR,
-    publisher="CDUT-IMRT", status=AssetStatus.VALIDATED,
+    publisher="CDUT-IMRT", status=AssetStatus.CANDIDATE,
     description=(
         "宽核CNN + Mamba 状态空间的轻量航空轴承故障诊断。"
         "95.44%准确率，仅 0.016M 参数。支持 -6~+6dB 噪声。"
@@ -954,7 +954,7 @@ ASSET_ISOLATION_FOREST_SCADA = EngineeringAssetManifest(
     asset_id="detector.scada.isolation_forest_anomaly",
     name="Isolation Forest 燃气轮机 SCADA 异常检测器",
     version="1.0.0", asset_kind=AssetKind.DETECTOR,
-    publisher="scikit-learn / davidfertube", status=AssetStatus.QUALIFIED,
+    publisher="scikit-learn / davidfertube", status=AssetStatus.CANDIDATE,
     description=(
         "基于 scikit-learn IsolationForest 的燃气轮机多维传感器异常检测。"
         "94.5%精度，91.2%召回率，<50ms推理。"
@@ -1004,7 +1004,7 @@ ASSET_FAULTSENSE_LSTM_AUTOENCODER = EngineeringAssetManifest(
     asset_id="detector.timeseries.faultsense_lstm_autoencoder",
     name="FaultSense LSTM 自编码器时序异常检测器",
     version="1.0.0", asset_kind=AssetKind.DETECTOR,
-    publisher="momo-2609", status=AssetStatus.VALIDATED,
+    publisher="momo-2609", status=AssetStatus.CANDIDATE,
     description=(
         "LSTM 自编码器 + 滑动窗口 + 重构误差自适应阈值。"
         "NASA CMAPSS 数据集 RMSE 14.85 (FD001) / 13.88 (FD003)。"
@@ -1231,7 +1231,7 @@ ASSET_CNN_LSTM_RUL = EngineeringAssetManifest(
     asset_id="reliability_model.rul.cnn_lstm_cmapss",
     name="CNN-LSTM 混合模型 RUL 预测器",
     version="1.0.0", asset_kind=AssetKind.RELIABILITY_MODEL,
-    publisher="muk0644", status=AssetStatus.VALIDATED,
+    publisher="muk0644", status=AssetStatus.CANDIDATE,
     description=(
         "混合 CNN-LSTM 架构用于 NASA CMAPSS 剩余寿命预测。"
         "RMSE 5.27 cycles，R² 99.15%。比较 7 种模型 (RF/XGBoost/LightGBM/LSTM/CNN/Bi-LSTM/CNN-LSTM)。"
@@ -1288,7 +1288,7 @@ ASSET_PY_FATIGUE_PARIS = EngineeringAssetManifest(
     asset_id="reliability_model.crack.py_fatigue_paris_law",
     name="py_fatigue Paris 裂纹扩展模型 (确定性)",
     version="1.0.0", asset_kind=AssetKind.RELIABILITY_MODEL,
-    publisher="OWI-Lab (Vrije Universiteit Brussel)", status=AssetStatus.QUALIFIED,
+    publisher="OWI-Lab (Vrije Universiteit Brussel)", status=AssetStatus.CANDIDATE,
     description=(
         "基于 Paris Law (da/dN = C·ΔK^m) 的确定性疲劳裂纹扩展计算。"
         "支持多斜率 Paris 曲线、Walker 平均应力修正、阈值/临界 SIF。"
@@ -1343,7 +1343,7 @@ ASSET_FRAMEWORK_FDPP_PROBABILISTIC = EngineeringAssetManifest(
     asset_id="reliability_model.crack.framework_fdpp_probabilistic",
     name="FrameworkFDPP 概率疲劳裂纹扩展模型 (MC仿真)",
     version="1.0.0", asset_kind=AssetKind.RELIABILITY_MODEL,
-    publisher="ansak95", status=AssetStatus.VALIDATED,
+    publisher="ansak95", status=AssetStatus.CANDIDATE,
     description=(
         "航空铝合金 7075 概率 Paris-Erdogan 裂纹扩展模型。"
         "C 对数正态分布 + m 高斯分布 (ρ=-0.996) + 初始裂纹高斯分布 (CoV)。"
@@ -1398,7 +1398,7 @@ ASSET_PYLIFE_SN_CURVE = EngineeringAssetManifest(
     asset_id="reliability_model.fatigue.pylife_sn_woehler",
     name="pyLife S-N 曲线疲劳寿命计算器 (Bosch/FKM)",
     version="1.0.0", asset_kind=AssetKind.RELIABILITY_MODEL,
-    publisher="Bosch Research", status=AssetStatus.QUALIFIED,
+    publisher="Bosch Research", status=AssetStatus.CANDIDATE,
     description=(
         "Bosch Research 开源 S-N 曲线疲劳分析库。FKM 非线性局部应力/应变概念。"
         "Wöhler 曲线拟合、雨流计数、损伤累积、失效概率计算。"
@@ -1444,7 +1444,7 @@ ASSET_PINN_FLEET_PROGNOSIS = EngineeringAssetManifest(
     asset_id="reliability_model.crack.pinn_fleet_prognosis",
     name="PINN 物理信息机群裂纹预后模型 (Paris Law + NN)",
     version="1.0.0", asset_kind=AssetKind.RELIABILITY_MODEL,
-    publisher="PML-UCF", status=AssetStatus.VALIDATED,
+    publisher="PML-UCF", status=AssetStatus.CANDIDATE,
     description=(
         "物理信息循环神经网络——Paris Law 层 + 应力强度层 + 累积损伤单元。"
         "融合已知物理(Paris)与数据驱动层。MIT 许可。"
@@ -1495,7 +1495,7 @@ ASSET_CHANGEPOINT_LSTM_RUL = EngineeringAssetManifest(
     asset_id="reliability_model.rul.changepoint_lstm_multicondition",
     name="ChangePoint-LSTM 多变工况 RUL 预测器",
     version="1.0.0", asset_kind=AssetKind.RELIABILITY_MODEL,
-    publisher="en-research", status=AssetStatus.VALIDATED,
+    publisher="en-research", status=AssetStatus.CANDIDATE,
     description=(
         "变点检测集成 LSTM 用于多变工况 RUL 估计。"
         "5.6%~7.5% 准确率提升（vs 标准 LSTM）于多条件场景(FD002+)。"
@@ -1549,7 +1549,7 @@ ASSET_OMIN_KNOWLEDGE = EngineeringAssetManifest(
     asset_id="knowledge_source.maintenance.omin_faa_knowledge",
     name="OMIn 航空维修知识源 (FAA 事故/事件 NER+CR)",
     version="1.0.0", asset_kind=AssetKind.KNOWLEDGE_SOURCE,
-    publisher="nd-crane (University of Notre Dame)", status=AssetStatus.VALIDATED,
+    publisher="nd-crane (University of Notre Dame)", status=AssetStatus.CANDIDATE,
     description=(
         "基于 FAA 事故/事件数据的操作与维修智能知识源。"
         "金标准命名实体识别+指代消解+实体链接标注。"
@@ -1594,7 +1594,7 @@ ASSET_BOEING_KNOWLEDGE_NER = EngineeringAssetManifest(
     asset_id="knowledge_source.maintenance.boeing_aviation_ner_knowledge",
     name="波音 Aviation NER 维修知识抽取器",
     version="1.0.0", asset_kind=AssetKind.KNOWLEDGE_SOURCE,
-    publisher="Boeing + FAA", status=AssetStatus.VALIDATED,
+    publisher="Boeing + FAA", status=AssetStatus.CANDIDATE,
     description=(
         "波音与FAA联合开发的 SDR 实体抽取模型。"
         "从服务困难报告中自动提取：飞行阶段/产品位置/机组动作/产品/产品状态等 7 类实体。"
@@ -1642,7 +1642,7 @@ ASSET_MAINTIE_KNOWLEDGE = EngineeringAssetManifest(
     asset_id="knowledge_source.maintenance.maintie_schema_knowledge",
     name="MaintIE 维修信息抽取细粒度知识本体",
     version="1.0.0", asset_kind=AssetKind.KNOWLEDGE_SOURCE,
-    publisher="nlp-tlp", status=AssetStatus.VALIDATED,
+    publisher="nlp-tlp", status=AssetStatus.CANDIDATE,
     description=(
         "维修短文本细粒度信息抽取本体和基准数据集。"
         "5 个顶层类、224 个叶实体、6 种关系类型。"

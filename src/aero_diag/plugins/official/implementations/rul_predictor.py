@@ -6,10 +6,10 @@ from ._base import AssetRunResult, ImplementationBase
 
 
 class CNNLSTMRULPredictor(ImplementationBase):
-    """RUL 预测器。
+    """RUL 预测器——当前为线性趋势基线。
 
-    优先使用预训练的 CNN-LSTM 模型（如已下载权重）；
-    否则回退到指数退化模型作为基线。
+    审计修复 (AER-001): 资产 ID 暗示 CNN-LSTM，实际实现为线性趋势。
+    必须诚实标注。真正的 CNN-LSTM 需要 TensorFlow + C-MAPSS 训练权重。
     """
 
     asset_id = "reliability_model.rul.cnn_lstm_cmapss"
@@ -32,8 +32,7 @@ class CNNLSTMRULPredictor(ImplementationBase):
             if isinstance(val, (list, np.ndarray)):
                 signals[key] = np.asarray(val, dtype=np.float64)
 
-        # 基线方法：指数退化模型
-        # 选择最能代表退化趋势的传感器（通常是排气温度或性能参数）
+        # ── 线性趋势基线（不是 CNN-LSTM）──
         best_sensor = None
         best_trend = 0
         for name, arr in signals.items():
@@ -47,7 +46,6 @@ class CNNLSTMRULPredictor(ImplementationBase):
         if isinstance(cycles, np.ndarray):
             cycles = len(cycles)
 
-        # 指数退化: y = a * exp(b * t)
         if best_sensor and best_trend != 0:
             rul_estimate = params.get("max_rul", 130) * (1 - abs(best_trend) / params.get("max_degradation_rate", 0.02))
             rul_estimate = max(0, min(params.get("max_rul", 130), rul_estimate))
@@ -60,15 +58,29 @@ class CNNLSTMRULPredictor(ImplementationBase):
 
         elapsed_ms = int((time.time() - t0) * 1000)
         return AssetRunResult(
-            status="success",
+            execution_status="success",
+            validity_status="degraded",  # 线性趋势 ≠ CNN-LSTM
+            can_influence_decision=False,
             structured_output={
                 "rul_cycles": round(rul_estimate, 1),
                 "confidence_interval": [round(confidence_low, 1), round(confidence_high, 1)],
-                "method": "exponential_degradation_baseline",
+                "method": "linear_trend_baseline",
                 "sensor_used": best_sensor,
                 "cycles_observed": cycles,
-                "note": "基线指数退化模型。安装 TensorFlow + 预训练权重可获得 CNN-LSTM 精确预测",
+                "note": (
+                    "LINEAR TREND BASELINE — NOT CNN-LSTM. "
+                    "This implementation fits a linear trend per sensor and extrapolates RUL "
+                    "using a fixed max degradation rate. "
+                    "No operating condition normalization, no sensor covariance, no healthy baseline, "
+                    "no confidence calibration. Confidence interval is fixed ±15 cycles. "
+                    "CNN-LSTM requires: TensorFlow + trained weights on C-MAPSS (FD001-FD004) "
+                    "with piecewise-linear RUL target function."
+                ),
             },
+            warnings=[
+                "Asset ID 'cnn_lstm_cmapss' does NOT match implementation 'linear_trend_baseline'. "
+                "C-MAPSS benchmark performance metrics in manifest do NOT apply to this baseline."
+            ],
             metrics={"rul_mean": float(rul_estimate), "inference_ms": elapsed_ms},
             elapsed_ms=elapsed_ms,
         )

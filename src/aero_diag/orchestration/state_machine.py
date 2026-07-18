@@ -158,6 +158,24 @@ class TaskStateMachine:
         """返回状态迁移的前置条件描述。"""
         return _TRANSITION_GATES.get((from_state, to_state), "")
 
+    # ── 审计修复 (AER-003): 强制门检查列表 ──
+    # 这些关键迁移必须有真实 checker，否则拒绝迁移
+    REQUIRED_GATES: set[tuple[TaskState, TaskState]] = {
+        (TaskState.RECEIVED, TaskState.DATA_VALIDATION),
+        (TaskState.DATA_VALIDATION, TaskState.PLAN_PROPOSAL),
+        (TaskState.PLAN_COMPILE, TaskState.DETECTION_EXECUTION),
+        (TaskState.DETECTION_EXECUTION, TaskState.CHARACTERIZATION),
+        (TaskState.EVIDENCE_FUSION, TaskState.DECISION_DRAFT),
+        (TaskState.DECISION_DRAFT, TaskState.EXPERT_REVIEW),
+        (TaskState.EXPERT_REVIEW, TaskState.APPROVED),
+    }
+
+    # ── 审计修复 (P0-5): 禁止自动归档 ──
+    # APPROVED→ARCHIVED 需要完整的证据包验证
+    FORBIDDEN_AUTO_TRANSITIONS: set[tuple[TaskState, TaskState]] = {
+        (TaskState.EXPERT_REVIEW, TaskState.APPROVED),   # 必须有真实签名
+    }
+
     def transition(
         self,
         to_state: TaskState,
@@ -192,12 +210,45 @@ class TaskStateMachine:
 
         # 2. 前置条件检查
         gate_description = self.transition_gate(from_state, to_state)
-        preconditions_met: list[str] = [gate_description] if gate_description else []
+        preconditions_met: list[str] = []
         preconditions_failed: list[str] = []
 
-        # 执行自定义检查器
-        custom_checker = self._gate_checkers.get((from_state, to_state))
-        if custom_checker is not None:
+        trans_key = (from_state, to_state)
+
+        # ── 审计修复: 禁止自动审批和自动归档 ──
+        if trans_key in self.FORBIDDEN_AUTO_TRANSITIONS:
+            if actor == "system":
+                raise InvalidTransitionError(
+                    f"Transition {from_state.value} -> {to_state.value} "
+                    f"REQUIRES authenticated human reviewer. "
+                    f"System auto-advance is FORBIDDEN for this transition."
+                )
+
+        # ── 审计修复 (AER-003): 关键迁移必须有真实 checker ──
+        custom_checker = self._gate_checkers.get(trans_key)
+        if trans_key in self.REQUIRED_GATES:
+            if custom_checker is None:
+                # 没有 checker → 迁移被阻断（而非伪造"已满足"）
+                raise InvalidTransitionError(
+                    f"GATE_BLOCKED: {from_state.value} -> {to_state.value}. "
+                    f"No gate checker registered for required transition. "
+                    f"Gate description: '{gate_description}'. "
+                    f"Register a checker via register_gate_checker() before attempting this transition."
+                )
+            # 执行 checker
+            try:
+                ok = custom_checker(context)
+                if ok:
+                    preconditions_met.append(f"gate:{gate_description}")
+                    preconditions_met.append("custom_check_passed")
+                else:
+                    preconditions_failed.append(f"gate:{gate_description}")
+                    preconditions_failed.append("custom_check_failed")
+            except Exception as e:
+                preconditions_failed.append(f"gate:{gate_description}")
+                preconditions_failed.append(f"custom_check_error: {e}")
+        elif custom_checker is not None:
+            # 非强制门但有自定义 checker
             try:
                 ok = custom_checker(context)
                 if ok:
@@ -206,10 +257,14 @@ class TaskStateMachine:
                     preconditions_failed.append("custom_check_failed")
             except Exception as e:
                 preconditions_failed.append(f"custom_check_error: {e}")
+        elif gate_description:
+            # 有门描述但没有 checker 的非强制门 → 记录为 warning 而非 met
+            preconditions_met.append(f"gate_description_only (no checker): {gate_description}")
+            # 注意: 这只是描述性门，不阻断迁移
 
         if preconditions_failed:
             raise InvalidTransitionError(
-                f"Precondition check failed for {from_state.value} -> {to_state.value}: "
+                f"Precondition check FAILED for {from_state.value} -> {to_state.value}: "
                 f"{preconditions_failed}"
             )
 
